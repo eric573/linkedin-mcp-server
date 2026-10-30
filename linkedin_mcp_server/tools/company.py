@@ -6,6 +6,7 @@ with configurable section selection.
 """
 
 import logging
+import time
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
@@ -22,6 +23,10 @@ from linkedin_mcp_server.linkedin.identifiers import (
     normalize_company_identifier,
 )
 from linkedin_mcp_server.linkedin.link_metadata import Reference
+from linkedin_mcp_server.linkedin.search_urls import (
+    build_company_search_url,
+    read_cursor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -159,26 +164,52 @@ def register_company_tools(
     async def search_companies(
         keywords: str,
         ctx: Context,
+        max_pages: Annotated[int, Field(ge=1, le=10)] = 1,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """
-        Search for companies on LinkedIn.
+        Search for companies on LinkedIn, ten per result page.
 
         Args:
             keywords: Search keywords (e.g., "fintech", "anthropic", "electric vehicles")
             ctx: FastMCP context for progress reporting
+            max_pages: Result pages to read in this call (1-10, default 1).
+                Each is a page load against the account's rate limit.
+            cursor: pagination.next_cursor from an earlier call with the same
+                keywords, to continue where it stopped.
 
         Returns:
-            Dict with url, sections (search_results -> raw text), and optional references.
-            The LLM should parse the raw text to extract individual companies and their pages.
+            Dict with url, sections (search_results -> raw text of every page
+            read, joined by "---"), and optional references. The LLM should
+            parse the raw text to extract individual companies and their pages.
+            pagination ({pages_fetched, next_cursor, reason}) says why reading
+            stopped, as in search_people: next_cursor is set only after
+            max_pages, time_budget or rate_limited.
         """
+        # Before the browser, as in search_jobs.
+        started = time.monotonic()
+        # Refused before the browser: a cursor from another search would page
+        # through results nobody asked for.
+        first_page = read_cursor(cursor, build_company_search_url(keywords), first=1)
         extractor = await get_ready_extractor(ctx, tool_name="search_companies")
-        logger.info("Searching companies: keywords='%s'", keywords)
+        logger.info(
+            "Searching companies: keywords='%s', pages %d-%d",
+            keywords,
+            first_page,
+            first_page + max_pages - 1,
+        )
 
         await ctx.report_progress(
             progress=0, total=100, message="Starting company search"
         )
 
-        result = await extractor.search_companies(keywords)
+        result = await extractor.search_companies(
+            keywords,
+            max_pages=max_pages,
+            first_page=first_page,
+            # What is left of the figure FastMCP cancels this call on.
+            tool_timeout=max(0.0, tool_timeout - (time.monotonic() - started)),
+        )
 
         await ctx.report_progress(progress=100, total=100, message="Complete")
 

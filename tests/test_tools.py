@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from typing import Any, Callable, Coroutine, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastmcp import FastMCP
@@ -106,6 +106,54 @@ def serve_extractor(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], AsyncMoc
             "search_people",
             {"keywords": "engineer", "location": "New York"},
             "numeric LinkedIn geo URN id",
+        ),
+        (
+            "person",
+            "search_people",
+            {},
+            "Give keywords, a filter",
+        ),
+        (
+            "person",
+            "search_people",
+            {"keywords": "  "},
+            "Give keywords, a filter",
+        ),
+        (
+            "person",
+            "search_people",
+            {"connection_of": "williamhgates"},
+            "connection_of must be a LinkedIn profile URN id",
+        ),
+        (
+            "person",
+            "search_people",
+            {"keywords": "engineer", "cursor": "two"},
+            "not one this server gave out",
+        ),
+        (
+            "person",
+            "search_people",
+            {"keywords": "engineer", "cursor": "2.00000000"},
+            "cursor belongs to a different search",
+        ),
+        (
+            "company",
+            "search_companies",
+            {"keywords": "fintech", "cursor": "2.00000000"},
+            "cursor belongs to a different search",
+        ),
+        (
+            "job",
+            "search_jobs",
+            {"keywords": "python", "cursor": "25.00000000"},
+            "cursor belongs to a different search",
+        ),
+        (
+            "job",
+            "get_saved_jobs",
+            {"cursor": "1.00000000"},
+            "cursor belongs to a different search",
         ),
         (
             "company",
@@ -773,7 +821,9 @@ class TestPersonTool:
 
         serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_people")
-        result = await tool_fn("AI engineer", mock_context, location="103644278")
+        result = await tool_fn(
+            mock_context, keywords="AI engineer", location="103644278"
+        )
         assert "search_results" in result["sections"]
         assert "pages_visited" not in result
         mock_extractor.search_people.assert_awaited_once_with(
@@ -781,6 +831,10 @@ class TestPersonTool:
             "103644278",
             network=None,
             current_company=None,
+            connection_of=None,
+            max_pages=1,
+            first_page=1,
+            tool_timeout=ANY,
         )
 
     async def test_search_people_with_network_and_company_filters(
@@ -806,8 +860,8 @@ class TestPersonTool:
         serve_extractor(mock_extractor)
         tool_fn = await get_tool_fn(mcp, "search_people")
         result = await tool_fn(
-            "engineer",
             mock_context,
+            keywords="engineer",
             network=["F"],
             current_company="1115",
         )
@@ -817,6 +871,10 @@ class TestPersonTool:
             None,
             network=["F"],
             current_company="1115",
+            connection_of=None,
+            max_pages=1,
+            first_page=1,
+            tool_timeout=ANY,
         )
 
     @pytest.mark.parametrize(
@@ -879,6 +937,10 @@ class TestPersonTool:
             None,
             network=["F"],
             current_company=None,
+            connection_of=None,
+            max_pages=1,
+            first_page=1,
+            tool_timeout=ANY,
         )
 
     async def test_search_people_validation_error_surfaced_as_tool_error(
@@ -904,8 +966,8 @@ class TestPersonTool:
 
         with pytest.raises(ToolError, match="must be a numeric URN"):
             await tool_fn(
-                "engineer",
                 mock_context,
+                keywords="engineer",
                 current_company="1115",
             )
 
@@ -1521,8 +1583,193 @@ class TestJobTools:
         assert "saved_jobs" in result["sections"]
         assert result["job_ids"] == ["111", "222"]
         mock_extractor.get_saved_jobs.assert_awaited_once_with(
-            max_pages=2, stage="saved"
+            max_pages=2, stage="saved", first_page=0
         )
+
+
+class TestResumingASearch:
+    """A cursor continues the search it came from, and only that one.
+
+    Checked at the tool boundary, before the browser: a cursor from another
+    search would read pages of results nobody asked for, each one a page load
+    against the account's rate limit.
+    """
+
+    @staticmethod
+    def _refuse_the_browser():
+        return AsyncMock(side_effect=AssertionError("get_ready_extractor was called"))
+
+    async def test_people_search_resumes_at_the_cursors_page(self, serve_extractor):
+        from linkedin_mcp_server.linkedin.search_urls import (
+            build_people_search_url,
+            make_cursor,
+        )
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        mock_extractor = _make_mock_extractor({"url": "u", "sections": {}})
+        mcp = FastMCP("test")
+        register_person_tools(mcp)
+        serve_extractor(mock_extractor)
+
+        cursor = make_cursor(3, build_people_search_url("engineer", network=["F"]))
+        await mcp.call_tool(
+            "search_people",
+            {
+                "keywords": "engineer",
+                "network": ["F"],
+                "max_pages": 2,
+                "cursor": cursor,
+            },
+        )
+
+        kwargs = mock_extractor.search_people.await_args.kwargs
+        assert kwargs["first_page"] == 3
+        assert kwargs["max_pages"] == 2
+
+    async def test_a_cursor_from_other_filters_is_refused(self):
+        """Same keywords, another network: a different list of people."""
+        from fastmcp.exceptions import ToolError
+
+        from linkedin_mcp_server.linkedin.search_urls import (
+            build_people_search_url,
+            make_cursor,
+        )
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        mcp = FastMCP("test")
+        register_person_tools(mcp)
+        ready = self._refuse_the_browser()
+        cursor = make_cursor(2, build_people_search_url("engineer", network=["F"]))
+
+        with patch("linkedin_mcp_server.tools.person.get_ready_extractor", ready):
+            with pytest.raises(ToolError, match="different search"):
+                await mcp.call_tool(
+                    "search_people",
+                    {"keywords": "engineer", "network": ["S"], "cursor": cursor},
+                )
+        ready.assert_not_awaited()
+
+    async def test_a_cursor_before_the_first_page_is_refused(self):
+        from fastmcp.exceptions import ToolError
+
+        from linkedin_mcp_server.linkedin.search_urls import (
+            build_people_search_url,
+            make_cursor,
+        )
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        mcp = FastMCP("test")
+        register_person_tools(mcp)
+        ready = self._refuse_the_browser()
+        cursor = make_cursor(0, build_people_search_url("engineer"))
+
+        with patch("linkedin_mcp_server.tools.person.get_ready_extractor", ready):
+            with pytest.raises(ToolError, match="before the first one"):
+                await mcp.call_tool(
+                    "search_people", {"keywords": "engineer", "cursor": cursor}
+                )
+        ready.assert_not_awaited()
+
+    async def test_a_members_connections_need_no_keywords(self, serve_extractor):
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        mock_extractor = _make_mock_extractor({"url": "u", "sections": {}})
+        mcp = FastMCP("test")
+        register_person_tools(mcp)
+        serve_extractor(mock_extractor)
+
+        await mcp.call_tool("search_people", {"connection_of": "ACoAABcdEfG"})
+
+        call = mock_extractor.search_people.await_args
+        assert call.args[0] == ""
+        assert call.kwargs["connection_of"] == "ACoAABcdEfG"
+
+    async def test_people_search_is_bounded_by_what_is_left_of_the_timeout(
+        self, mock_context
+    ):
+        """As in job search: the browser's start-up is spent from the same figure."""
+        mock_extractor = _make_mock_extractor({"url": "u", "sections": {}})
+
+        async def slow_start(*args, **kwargs):
+            await asyncio.sleep(0.3)
+            return mock_extractor
+
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        mcp = FastMCP("test")
+        register_person_tools(mcp, tool_timeout=60.0)
+        tool_fn = await get_tool_fn(mcp, "search_people")
+        with patch(
+            "linkedin_mcp_server.tools.person.get_ready_extractor",
+            side_effect=slow_start,
+        ):
+            await tool_fn(mock_context, keywords="engineer")
+
+        passed = mock_extractor.search_people.await_args.kwargs["tool_timeout"]
+        assert 59.0 < passed < 59.9
+
+    async def test_company_search_resumes_at_the_cursors_page(self, serve_extractor):
+        from linkedin_mcp_server.linkedin.search_urls import (
+            build_company_search_url,
+            make_cursor,
+        )
+        from linkedin_mcp_server.tools.company import register_company_tools
+
+        mock_extractor = _make_mock_extractor({"url": "u", "sections": {}})
+        mcp = FastMCP("test")
+        register_company_tools(mcp)
+        serve_extractor(mock_extractor)
+
+        cursor = make_cursor(4, build_company_search_url("fintech"))
+        await mcp.call_tool(
+            "search_companies", {"keywords": "fintech", "cursor": cursor}
+        )
+
+        assert mock_extractor.search_companies.await_args.kwargs["first_page"] == 4
+
+    async def test_job_search_resumes_at_the_cursors_offset(self, serve_extractor):
+        from linkedin_mcp_server.linkedin.search_urls import (
+            build_job_search_url,
+            make_cursor,
+        )
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mock_extractor = _make_mock_extractor({"url": "u", "sections": {}})
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+        serve_extractor(mock_extractor)
+
+        cursor = make_cursor(47, build_job_search_url("python", work_type="remote"))
+        await mcp.call_tool(
+            "search_jobs",
+            {"keywords": "python", "work_type": "remote", "cursor": cursor},
+        )
+
+        assert mock_extractor.search_jobs.await_args.kwargs["first_offset"] == 47
+
+    async def test_a_saved_jobs_cursor_belongs_to_its_stage(self, serve_extractor):
+        """The applied tab's pages are not the saved tab's."""
+        from fastmcp.exceptions import ToolError
+
+        from linkedin_mcp_server.linkedin.job_policy import saved_jobs_list_url
+        from linkedin_mcp_server.linkedin.search_urls import make_cursor
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mock_extractor = _make_mock_extractor({"url": "u", "sections": {}})
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+        ready = serve_extractor(mock_extractor)
+        cursor = make_cursor(2, saved_jobs_list_url("saved"))
+
+        await mcp.call_tool("get_saved_jobs", {"cursor": cursor})
+        assert mock_extractor.get_saved_jobs.await_args.kwargs["first_page"] == 2
+
+        ready.reset_mock()
+        with pytest.raises(ToolError, match="different search"):
+            await mcp.call_tool(
+                "get_saved_jobs", {"stage": "applied", "cursor": cursor}
+            )
+        ready.assert_not_awaited()
 
 
 class TestGetSidebarProfilesTool:
@@ -2326,7 +2573,9 @@ class TestSearchCompaniesTool:
         tool_fn = await get_tool_fn(mcp, "search_companies")
         result = await tool_fn("fintech", mock_context)
         assert "search_results" in result["sections"]
-        mock_extractor.search_companies.assert_awaited_once_with("fintech")
+        mock_extractor.search_companies.assert_awaited_once_with(
+            "fintech", max_pages=1, first_page=1, tool_timeout=ANY
+        )
 
     async def test_search_companies_error(self, mock_context, serve_extractor):
         from fastmcp.exceptions import ToolError

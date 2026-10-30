@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from urllib.parse import quote_plus
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit
 
+import hashlib
 import json
 import re
 
+from linkedin_mcp_server.core.exceptions import InvalidReferenceError
 from linkedin_mcp_server.linkedin.contracts import FilterValidationError
 
 # Normalization maps for job search filters. Job search encodes recency as
@@ -72,6 +74,15 @@ CONTENT_TYPE_MAP = {
     "documents": "documents",
 }
 
+# A member's profile URN id, as ``get_person_profile`` returns it, with or
+# without the URN prefix. Narrower than what
+# ``identifiers.normalize_profile_urn`` accepts, because a vanity name has the
+# same characters and LinkedIn ignores one in the connections filter, which
+# answers with everyone the rest of the search matches. Every member id read
+# so far begins ``ACoA``, and a vanity name that does is not worth the guess.
+_PROFILE_URN_PREFIX = "urn:li:fsd_profile:"
+_MEMBER_ID = re.compile(r"^ACoA[A-Za-z0-9_-]+$")
+
 # Valid tokens for the people-search ``network`` facet.
 # LinkedIn accepts "F" (1st-degree), "S" (2nd-degree), "O" (3rd-degree and beyond).
 NETWORK_TOKENS = ("F", "S", "O")
@@ -136,6 +147,8 @@ def build_people_search_url(
     location: str | None = None,
     network: list[str] | None = None,
     current_company: str | None = None,
+    connection_of: str | None = None,
+    page: int = 1,
 ) -> str:
     """Build a LinkedIn people search URL, refusing filters LinkedIn ignores.
 
@@ -149,6 +162,15 @@ def build_people_search_url(
     search filters on the numeric geo URN id via the ``geoUrn`` list facet, and
     a ``location=`` query parameter is ignored outright -- so a search that
     reads as scoped to one city returns the whole world.
+
+    ``connection_of`` is a member's profile URN id, the ``ACoAA...`` value
+    ``get_person_profile`` returns as ``profile_urn``, and filters to that
+    member's connections through LinkedIn's ``connectionOf`` facet, the one its
+    own "connections" link on a profile opens. A vanity name is refused for the
+    same reason as a place name: LinkedIn would ignore it.
+
+    ``page`` is LinkedIn's own result page, ten people each; the first page
+    carries no parameter.
     """
     if network is not None:
         invalid = [t for t in network if t not in NETWORK_TOKENS]
@@ -175,6 +197,18 @@ def build_people_search_url(
             f'URN via get_company_profile -> references["about"].'
         )
 
+    # Blank is no filter, as for the company and the place.
+    member = None
+    if connection_of is not None and connection_of.strip():
+        member = connection_of.strip().removeprefix(_PROFILE_URN_PREFIX)
+        if not _MEMBER_ID.fullmatch(member):
+            raise FilterValidationError(
+                f"connection_of must be a LinkedIn profile URN id, the "
+                f"profile_urn get_person_profile returns (e.g. "
+                f"'ACoAABcdEfG...'); got {connection_of!r}. A username or "
+                f"profile URL is ignored by LinkedIn's connections filter."
+            )
+
     params = f"keywords={quote_plus(keywords)}"
     if location:
         params += f"&geoUrn={_encode_list_facet([location])}"
@@ -182,22 +216,108 @@ def build_people_search_url(
         params += f"&network={_encode_list_facet(network)}"
     if current_company:
         params += f"&currentCompany={_encode_list_facet([current_company])}"
+    if member:
+        params += f"&connectionOf={_encode_list_facet([member])}"
+    params += _page_parameter(page)
 
     return f"https://www.linkedin.com/search/results/people/?{params}"
 
 
-def build_company_search_url(keywords: str) -> str:
+def build_company_search_url(keywords: str, page: int = 1) -> str:
     """Build a LinkedIn company search URL.
 
-    One parameter today, and a function anyway: every search URL this server
+    A function even for a few parameters: every search URL this server
     navigates to is then written in one place, so the next caller has nothing
     to assemble by hand and no second spelling of the host and route to keep
-    in step with the other three.
+    in step with the other three. ``page`` is LinkedIn's own result page, as
+    in people search.
     """
     return (
         "https://www.linkedin.com/search/results/companies/"
-        f"?keywords={quote_plus(keywords)}"
+        f"?keywords={quote_plus(keywords)}{_page_parameter(page)}"
     )
+
+
+def _page_parameter(page: int) -> str:
+    """``&page=N`` for a later result page, nothing for the first."""
+    if page < 1:
+        raise FilterValidationError(f"page must be 1 or more, got {page}")
+    return "" if page == 1 else f"&page={page}"
+
+
+# -- resuming a paged search -------------------------------------------------
+#
+# A cursor is the position the next call starts from, followed by a short
+# fingerprint of the search it belongs to: "3.1f2e3d4c" resumes that search at
+# position 3. Handed back to a different search, it would page through results
+# the caller never asked for, so the fingerprint refuses it. The position is a
+# result page for people and company search, an offset for job search and a
+# page index for the saved-jobs tracker; the search it belongs to decides.
+
+_PAGING_PARAMETERS = frozenset({"page", "start"})
+
+
+def search_fingerprint(url: str) -> str:
+    """Eight hex digits naming one search: its route and query, paging aside."""
+    parts = urlsplit(url)
+    query = sorted(
+        (name, value)
+        for name, value in parse_qsl(parts.query, keep_blank_values=True)
+        if name not in _PAGING_PARAMETERS
+    )
+    identity = f"{parts.netloc}{parts.path.rstrip('/')}?{urlencode(query)}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+
+
+def make_cursor(position: int, search_url: str) -> str:
+    """The cursor that resumes the search at *search_url* from *position*."""
+    return f"{position}.{search_fingerprint(search_url)}"
+
+
+# Why a paged read stopped, when another call can pick up where it did. A read
+# that ran out of results, or met the same results again, has nothing left.
+_RESUMABLE_STOPS = frozenset({"max_pages", "time_budget", "rate_limited"})
+
+
+def next_cursor(reason: str, position: int, search_url: str) -> str | None:
+    """The cursor for a read that stopped for *reason* before *position*.
+
+    None when the stop leaves nothing to read, so a cursor in a result always
+    means more can be had.
+    """
+    if reason not in _RESUMABLE_STOPS:
+        return None
+    return make_cursor(position, search_url)
+
+
+def read_cursor(cursor: str | None, search_url: str, *, first: int) -> int:
+    """Where *cursor* resumes the search at *search_url*; *first* without one.
+
+    Raises:
+        InvalidReferenceError: When the cursor is malformed or came from a
+            different search.
+    """
+    if cursor is None or not cursor.strip():
+        return first
+    position_text, separator, fingerprint = cursor.strip().partition(".")
+    if not separator or not position_text.isdigit() or not fingerprint:
+        raise InvalidReferenceError(
+            f"cursor {cursor!r} is not one this server gave out. Pass the "
+            "pagination.next_cursor of the previous result exactly, or leave "
+            "cursor out to start from the beginning."
+        )
+    if fingerprint != search_fingerprint(search_url):
+        raise InvalidReferenceError(
+            "cursor belongs to a different search. Repeat the search it came "
+            "from with the same keywords and filters, or leave cursor out to "
+            "start this one from the beginning."
+        )
+    position = int(position_text)
+    if position < first:
+        raise InvalidReferenceError(
+            f"cursor {cursor!r} names a position before the first one."
+        )
+    return position
 
 
 def build_content_search_url(

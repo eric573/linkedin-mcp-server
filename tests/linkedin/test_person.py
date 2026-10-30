@@ -7,6 +7,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import importlib.util
 
@@ -1848,6 +1849,37 @@ class TestSidebarProgramText:
 
 
 class TestSearchPeople:
+    async def test_a_members_connections_are_read_page_by_page(self, mock_page):
+        """Every page keeps the search's filters and adds LinkedIn's page number."""
+        member = "ACoAAB1IelEBLEkqTkNbZ-a1D8mq5R-6C1ihSEk"
+        reader = _reader(mock_page)
+        with patch.object(
+            reader._capture,
+            "capture",
+            new_callable=AsyncMock,
+            side_effect=[
+                extracted("Ada", [{"kind": "person", "url": "/in/ada/"}]),
+                extracted("Bob", [{"kind": "person", "url": "/in/bob/"}]),
+            ],
+        ) as capture:
+            result = await reader.search_people(
+                "", network=["F", "S"], connection_of=member, max_pages=2
+            )
+
+        queries = [parse_qs(urlparse(c.args[0]).query) for c in capture.await_args_list]
+        assert [query.get("page") for query in queries] == [None, ["2"]]
+        assert all(query["connectionOf"] == [f'["{member}"]'] for query in queries)
+        assert all(query["network"] == ['["F","S"]'] for query in queries)
+        assert result["sections"] == {"search_results": "Ada\n---\nBob"}
+        assert result["pagination"]["reason"] == "max_pages"
+
+    async def test_a_vanity_name_costs_no_page_load(self, mock_page):
+        reader = _reader(mock_page)
+        with pytest.raises(ValueError, match="connection_of"):
+            await reader.search_people("engineer", connection_of="williamhgates")
+
+        mock_page.goto.assert_not_awaited()
+
     async def test_search_people_omits_orphaned_references(self, mock_page):
         reader = _reader(mock_page)
         with patch.object(

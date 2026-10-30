@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+from linkedin_mcp_server.core.exceptions import InvalidReferenceError
 from linkedin_mcp_server.linkedin.contracts import FilterValidationError
 from linkedin_mcp_server.linkedin.search_urls import (
     CONTENT_DATE_POSTED_MAP,
@@ -27,6 +28,9 @@ from linkedin_mcp_server.linkedin.search_urls import (
     build_content_search_url,
     build_job_search_url,
     build_people_search_url,
+    make_cursor,
+    next_cursor,
+    read_cursor,
 )
 
 JOBS = "https://www.linkedin.com/jobs/search/?"
@@ -563,9 +567,158 @@ class TestBuildPeopleSearchUrl:
             build_people_search_url("engineer", network=["X"], current_company="SAP")
 
 
+class TestPeopleSearchPagesAndConnections:
+    # A real member id, as get_person_profile returns it.
+    MEMBER = "ACoAAB1IelEBLEkqTkNbZ-a1D8mq5R-6C1ihSEk"
+
+    def test_the_first_page_carries_no_page_parameter(self):
+        assert build_people_search_url("engineer", page=1) == (
+            f"{PEOPLE}keywords=engineer"
+        )
+
+    def test_a_later_page_is_linkedins_own_page_parameter(self):
+        assert build_people_search_url("engineer", page=3) == (
+            f"{PEOPLE}keywords=engineer&page=3"
+        )
+
+    @pytest.mark.parametrize("page", [0, -1])
+    def test_a_page_before_the_first_is_refused(self, page: int):
+        with pytest.raises(FilterValidationError, match="page must be 1 or more"):
+            build_people_search_url("engineer", page=page)
+
+    def test_a_members_connections_are_the_connection_of_facet(self):
+        url = build_people_search_url("", network=["F", "S"], connection_of=self.MEMBER)
+        query = parse_qs(urlparse(url).query, keep_blank_values=True)
+        assert query["connectionOf"] == [f'["{self.MEMBER}"]']
+        assert query["network"] == ['["F","S"]']
+        assert query["keywords"] == [""]
+
+    def test_the_urn_prefix_is_dropped_from_the_member(self):
+        url = build_people_search_url(
+            "engineer", connection_of=f"urn:li:fsd_profile:{self.MEMBER}"
+        )
+        assert parse_qs(urlparse(url).query)["connectionOf"] == [f'["{self.MEMBER}"]']
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "williamhgates",
+            "bill-gates-123",
+            "https://www.linkedin.com/in/williamhgates/",
+            "/in/williamhgates/",
+            "urn:li:fsd_profile:",
+            "ACoA AB1Iel",
+        ],
+    )
+    def test_anything_but_a_member_id_is_refused(self, value: str):
+        # LinkedIn ignores a vanity name in this facet and answers with
+        # everyone the rest of the search matches, which reads as the
+        # member's connections.
+        with pytest.raises(FilterValidationError, match="connection_of"):
+            build_people_search_url("engineer", connection_of=value)
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_a_blank_member_is_omitted_rather_than_refused(self, value: str):
+        assert build_people_search_url("engineer", connection_of=value) == (
+            f"{PEOPLE}keywords=engineer"
+        )
+
+    def test_the_page_follows_every_filter(self):
+        url = build_people_search_url(
+            "engineer",
+            location="103644278",
+            network=["S"],
+            current_company="1115",
+            connection_of=self.MEMBER,
+            page=2,
+        )
+        assert url.endswith("&page=2")
+        assert list(parse_qs(urlparse(url).query)) == [
+            "keywords",
+            "geoUrn",
+            "network",
+            "currentCompany",
+            "connectionOf",
+            "page",
+        ]
+
+
+class TestCursors:
+    """A cursor resumes the search it came from, at the position it names."""
+
+    PEOPLE_SEARCH = build_people_search_url("engineer", network=["F"])
+
+    def test_a_cursor_reads_back_as_its_position(self):
+        cursor = make_cursor(4, self.PEOPLE_SEARCH)
+        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == 4
+
+    def test_the_page_a_url_is_on_does_not_change_the_search(self):
+        # The walk builds the cursor from page one's address and the tool
+        # checks it against the same, but neither may depend on that.
+        later = build_people_search_url("engineer", network=["F"], page=7)
+        cursor = make_cursor(8, later)
+        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == 8
+        jobs = build_job_search_url("python")
+        assert read_cursor(make_cursor(50, f"{jobs}&start=25"), jobs, first=0) == 50
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            build_people_search_url("designer", network=["F"]),
+            build_people_search_url("engineer", network=["S"]),
+            build_people_search_url("engineer"),
+            build_people_search_url(
+                "engineer", network=["F"], connection_of="ACoAAB1IelEB"
+            ),
+            build_company_search_url("engineer"),
+        ],
+    )
+    def test_a_cursor_from_another_search_is_refused(self, other: str):
+        cursor = make_cursor(2, other)
+        with pytest.raises(InvalidReferenceError, match="different search"):
+            read_cursor(cursor, self.PEOPLE_SEARCH, first=1)
+
+    @pytest.mark.parametrize("cursor", [None, "", "   "])
+    def test_no_cursor_starts_at_the_first_position(self, cursor):
+        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == 1
+        assert read_cursor(cursor, build_job_search_url("python"), first=0) == 0
+
+    @pytest.mark.parametrize("cursor", ["2", "two.abcd1234", "-1.abcd1234", "2.", ".x"])
+    def test_a_malformed_cursor_is_refused(self, cursor: str):
+        with pytest.raises(InvalidReferenceError, match="not one this server gave out"):
+            read_cursor(cursor, self.PEOPLE_SEARCH, first=1)
+
+    def test_a_position_before_the_first_is_refused(self):
+        cursor = make_cursor(0, self.PEOPLE_SEARCH)
+        with pytest.raises(InvalidReferenceError, match="before the first one"):
+            read_cursor(cursor, self.PEOPLE_SEARCH, first=1)
+
+    @pytest.mark.parametrize("reason", ["max_pages", "time_budget", "rate_limited"])
+    def test_a_stop_that_leaves_results_comes_with_a_cursor(self, reason: str):
+        cursor = next_cursor(reason, 3, self.PEOPLE_SEARCH)
+        assert cursor is not None
+        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == 3
+
+    @pytest.mark.parametrize(
+        "reason", ["complete", "no_new_results", "no_new_ids", "anything else"]
+    )
+    def test_a_stop_that_leaves_nothing_has_no_cursor(self, reason: str):
+        # A caller looping while a cursor comes back would otherwise never
+        # stop, and pay a page load each time round.
+        assert next_cursor(reason, 3, self.PEOPLE_SEARCH) is None
+
+
 class TestBuildCompanySearchUrl:
     def test_keywords_only(self):
         assert build_company_search_url("engine") == f"{COMPANIES}keywords=engine"
+
+    def test_a_later_page_is_linkedins_own_page_parameter(self):
+        assert build_company_search_url("engine", page=2) == (
+            f"{COMPANIES}keywords=engine&page=2"
+        )
+        assert build_company_search_url("engine", page=1) == (
+            f"{COMPANIES}keywords=engine"
+        )
 
     @pytest.mark.parametrize("keywords,encoded", ENCODED_KEYWORDS)
     def test_keywords_are_percent_encoded(self, keywords: str, encoded: str):

@@ -67,11 +67,11 @@ Use code <strong>FOUNDING20</strong> for 20% off your first year. <a href="https
 | `send_message` | Send after confirmation; profile targets may open a new DM ([#483](https://github.com/stickerdaniel/linkedin-mcp-server/issues/483)). |
 | `get_company_profile` | Read company information, with optional sections for posts and open jobs. |
 | `get_company_posts` | Read recent posts from a company's feed, with links to the original posts. |
-| `search_companies` | Find companies by keyword and return links to their LinkedIn profiles. |
+| `search_companies` | Find companies by keyword and return links to their LinkedIn profiles, one or more pages at a time. |
 | `get_company_employees` | Find company employees, optionally filtered by name, title, or skill. |
-| `search_jobs` | Find job postings by keyword and location, with job IDs for reading details. |
-| `get_saved_jobs` | List your saved job postings, with job IDs for looking up their details. |
-| `search_people` | Find people by keyword, location, connection degree, and current company. |
+| `search_jobs` | Find job postings by keyword and location, with job IDs for reading details and a cursor to continue. |
+| `get_saved_jobs` | List your saved job postings, with job IDs for looking up their details and a cursor to continue. |
+| `search_people` | Find people by keyword, location, connection degree, current company (a company's employees), or a member's connections, one or more pages at a time. |
 | `get_job_details` | Read a job posting's description, requirements, and company details. |
 | `get_job_apply_url` | Check whether a job uses Easy Apply or links to an employer's application. |
 | `get_feed` | Read recent posts from your home feed, with links to the original posts. |
@@ -744,6 +744,12 @@ Everything the server asks of LinkedIn draws on one budget for the whole account
 - When LinkedIn pushes back (HTTP 429 or 999, its rate-limit page, or a page still empty after a retry), every request stops: as long as LinkedIn asks and at least 15 minutes, doubling for each repeat within a day. A checkpoint or CAPTCHA met during a tool call stops tool calls for 24 hours; signing in yourself is never blocked.
 
 A call that would have to wait more than 30 seconds, or longer than it has left, is refused with the `rate_limited` error code and `retry_after` in seconds, and keeps any pages it already read. `get_session_status` shows what is spent and when the next visit is allowed, without opening the browser. LinkedIn publishes none of its limits, so these are cautious guesses, and every one is a setting.
+
+### Paging
+
+`search_people` and `search_companies` read one page of ten results unless `max_pages` asks for more, up to 10 in one call; `search_jobs` and `get_saved_jobs` read three by default. Each page is a page visit against the budget above. When results were left unread, because `max_pages` was reached, the tool's time ran short, or the rate limit stopped the call, the result's `pagination.next_cursor` continues the search: pass it back as `cursor` with the same keywords and filters. A cursor from a different search is refused before anything is loaded, and a search that ran out of results returns none, so a loop that pages while a cursor comes back ends on its own.
+
+Lists LinkedIn loads by scrolling, such as the feed, post search and the inbox, cannot be resumed this way: ask for what you need in one call.
 
 ### Setup Help
 

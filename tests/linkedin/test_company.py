@@ -662,12 +662,39 @@ class TestSearchCompanies:
 
         url = mock_extract.call_args.args[0]
         assert "/search/results/companies/" in url
-        assert mock_extract.call_args.args[1] == "search_results"
-        assert mock_extract.call_args.args[2].mode is CaptureMode.SEARCH_RESULTS
+        assert mock_extract.call_args.kwargs["section_name"] == "search_results"
+        assert mock_extract.call_args.kwargs["plan"].mode is CaptureMode.SEARCH_RESULTS
+        # A page that links to no company is the end of the list, so nothing
+        # is left to resume.
         assert result == {
             "url": url,
             "sections": {"search_results": "Fintech Inc"},
+            "pagination": {
+                "pages_fetched": 1,
+                "next_cursor": None,
+                "reason": "complete",
+            },
         }
+
+    async def test_later_result_pages_are_read_on_request(self, mock_page):
+        reader = _reader(mock_page)
+        with patch.object(
+            reader._capture,
+            "capture",
+            new_callable=AsyncMock,
+            side_effect=[
+                extracted("Acme", [{"kind": "company", "url": "/company/acme/"}]),
+                extracted("Beta", [{"kind": "company", "url": "/company/beta/"}]),
+            ],
+        ) as mock_extract:
+            result = await reader.search_companies("fintech", first_page=3, max_pages=2)
+
+        assert [c.args[0] for c in mock_extract.await_args_list] == [
+            "https://www.linkedin.com/search/results/companies/?keywords=fintech&page=3",
+            "https://www.linkedin.com/search/results/companies/?keywords=fintech&page=4",
+        ]
+        assert result["sections"] == {"search_results": "Acme\n---\nBeta"}
+        assert result["pagination"]["reason"] == "max_pages"
 
     async def test_an_empty_result_omits_the_optional_keys(self, mock_page):
         reader = _reader(mock_page)

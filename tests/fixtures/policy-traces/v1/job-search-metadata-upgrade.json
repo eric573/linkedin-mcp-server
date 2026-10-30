@@ -316,6 +316,7 @@
       "101"
     ],
     "pagination": {
+      "next_cursor": null,
       "next_offset": 2,
       "pages_fetched": 2,
       "reason": "no_new_ids"

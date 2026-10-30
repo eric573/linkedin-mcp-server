@@ -33,6 +33,7 @@ from linkedin_mcp_server.linkedin.job_pages import (
 from linkedin_mcp_server.linkedin.jobs import JobReader
 from linkedin_mcp_server.linkedin.link_metadata import Reference
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
+from linkedin_mcp_server.linkedin.search_urls import make_cursor
 from linkedin_mcp_server.linkedin.session import PageSession
 from linkedin_mcp_server.linkedin.text import JOB_APPLY_EN_US
 from linkedin.support.navigation import navigate
@@ -718,6 +719,7 @@ class TestSearchJobs:
         assert result["pagination"] == {
             "pages_fetched": 2,
             "next_offset": 5,
+            "next_cursor": make_cursor(5, result["url"]),
             "reason": "max_pages",
         }
 
@@ -982,8 +984,14 @@ class TestSearchJobs:
         message = result["section_errors"]["search_results"]["error_message"]
         assert "location" in message
         assert RATE_LIMITED_SECTION_TEXT in message
-        # Page one was kept, and the list still ends on a failure.
-        assert "pagination" not in result
+        # Page one was kept, and the search resumes at the page LinkedIn
+        # refused rather than ending on it.
+        assert result["pagination"] == {
+            "pages_fetched": 2,
+            "next_offset": 1,
+            "next_cursor": make_cursor(1, result["url"]),
+            "reason": "rate_limited",
+        }
 
     async def test_a_search_answered_for_something_else_stops_the_loop(self, mock_page):
         """The route can be right and the offset right while the query is gone.
@@ -1289,6 +1297,7 @@ class TestSearchJobs:
         assert result["pagination"] == {
             "pages_fetched": 2,
             "next_offset": 4,
+            "next_cursor": None,
             "reason": "no_new_ids",
         }
 
@@ -1333,6 +1342,7 @@ class TestSearchJobs:
         assert result["pagination"] == {
             "pages_fetched": 1,
             "next_offset": 25,
+            "next_cursor": None,
             "reason": "complete",
         }
 
@@ -1507,6 +1517,7 @@ class TestSearchJobs:
         assert result["pagination"] == {
             "pages_fetched": 7,
             "next_offset": 70,
+            "next_cursor": make_cursor(70, result["url"]),
             "reason": "time_budget",
         }
 
@@ -1645,6 +1656,7 @@ class TestSearchJobs:
         assert result["pagination"] == {
             "pages_fetched": 0,
             "next_offset": 0,
+            "next_cursor": make_cursor(0, result["url"]),
             "reason": "max_pages",
         }
 
@@ -1753,6 +1765,7 @@ class TestSearchJobs:
         assert result["pagination"] == {
             "pages_fetched": 1,
             "next_offset": 0,
+            "next_cursor": None,
             "reason": "complete",
         }
 
@@ -1959,6 +1972,7 @@ class TestSearchJobs:
         assert result["pagination"] == {
             "pages_fetched": 1,
             "next_offset": 0,
+            "next_cursor": None,
             "reason": "complete",
         }
 
@@ -2087,6 +2101,7 @@ class TestSearchJobs:
         assert result["pagination"] == {
             "pages_fetched": 2,
             "next_offset": 1,
+            "next_cursor": None,
             "reason": "complete",
         }
 
@@ -2582,7 +2597,13 @@ class TestSearchJobs:
         assert result["sections"] == {}
         assert result["section_errors"]["search_results"]["error_type"] == "rate_limit"
         mock_ids.assert_not_awaited()
-        assert "pagination" not in result
+        # Nothing was read, so the search resumes from its start.
+        assert result["pagination"] == {
+            "pages_fetched": 1,
+            "next_offset": 0,
+            "next_cursor": make_cursor(0, result["url"]),
+            "reason": "rate_limited",
+        }
 
     async def test_rate_limit_wins_over_an_unexpected_landing(self, mock_page):
         """The specific diagnosis survives a simultaneous route failure."""
@@ -3469,6 +3490,7 @@ class TestARateLimitRefusalMidSearch:
         assert result["pagination"] == {
             "pages_fetched": 1,
             "next_offset": 2,
+            "next_cursor": make_cursor(2, result["url"]),
             "reason": "rate_limited",
         }
         error = result["section_errors"]["search_results"]
@@ -3517,3 +3539,249 @@ class TestARateLimitRefusalMidSearch:
 
         assert result["job_ids"] == ["111", "222"]
         assert result["section_errors"]["saved_jobs"]["retry_after"] == 240
+
+
+class TestResumingFromACursor:
+    """A later call picks the list up where an earlier one stopped."""
+
+    @staticmethod
+    def _navigating(mock_page, texts, asked):
+        supply = iter(texts)
+
+        async def navigate_to(url, *args, **kwargs):
+            asked.append(url)
+            navigate(mock_page, url)
+            return captured(mock_page, next(supply))
+
+        return navigate_to
+
+    async def test_a_search_starts_at_the_cursors_offset(self, mock_page):
+        reader = _reader(mock_page)
+        asked: list[str] = []
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_search_page",
+                side_effect=self._navigating(
+                    mock_page, [extracted("python jobs")], asked
+                ),
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["201", "202", "203"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.search_jobs("python", max_pages=1, first_offset=50)
+
+        assert parse_qs(urlparse(asked[0]).query)["start"] == ["50"]
+        assert result["job_ids"] == ["201", "202", "203"]
+        # The offset counts on from where the cursor put it.
+        assert result["pagination"] == {
+            "pages_fetched": 1,
+            "next_offset": 53,
+            "next_cursor": make_cursor(53, result["url"]),
+            "reason": "max_pages",
+        }
+
+    async def test_a_resumed_search_past_its_results_matched_after_all(self, mock_page):
+        """The matches were on the pages an earlier call read.
+
+        LinkedIn's recommendations past the last result are the end of the
+        list, not a search that matched nothing, so no such error is added.
+        """
+        reader = _reader(mock_page)
+        asked: list[str] = []
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_search_page",
+                side_effect=self._navigating(
+                    mock_page,
+                    [extracted("Jobs you may be interested in\nMLOps Engineer")],
+                    asked,
+                ),
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["999"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.search_jobs("python", max_pages=3, first_offset=25)
+
+        assert len(asked) == 1
+        assert result["job_ids"] == []
+        assert "section_errors" not in result
+        assert result["pagination"]["reason"] == "complete"
+        assert result["pagination"]["next_cursor"] is None
+
+    async def test_saved_jobs_start_at_the_cursors_page(self, mock_page):
+        mock_page.url = "https://www.linkedin.com/jobs-tracker/?stage=saved"
+        reader = _reader(mock_page)
+        asked: list[str] = []
+        ids = iter([["301", "302"], ["303"]])
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_saved_jobs_page",
+                side_effect=self._navigating(
+                    mock_page, [extracted("Saved 3"), extracted("Saved 4")], asked
+                ),
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                side_effect=lambda *a, **k: next(ids),
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=2, first_page=2)
+
+        assert [parse_qs(urlparse(url).query)["start"] for url in asked] == [
+            ["20"],
+            ["30"],
+        ]
+        assert result["job_ids"] == ["301", "302", "303"]
+        assert result["url"] == "https://www.linkedin.com/jobs-tracker/?stage=saved"
+        assert result["pagination"] == {
+            "pages_fetched": 2,
+            "next_cursor": make_cursor(4, result["url"]),
+            "reason": "max_pages",
+        }
+
+    async def test_saved_jobs_read_to_their_last_page_leave_no_cursor(self, mock_page):
+        """LinkedIn said how many pages there are, and the last one was read.
+
+        A cursor would only buy a navigation to a page that is not there.
+        """
+        mock_page.url = "https://www.linkedin.com/jobs-tracker/?stage=saved"
+        reader = _reader(mock_page)
+        asked: list[str] = []
+        ids = iter([["301"], ["302"]])
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_saved_jobs_page",
+                side_effect=self._navigating(
+                    mock_page, [extracted("Saved 1"), extracted("Saved 2")], asked
+                ),
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                side_effect=lambda *a, **k: next(ids),
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=2,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=2)
+
+        assert len(asked) == 2
+        assert result["pagination"] == {
+            "pages_fetched": 2,
+            "next_cursor": None,
+            "reason": "complete",
+        }
+
+    async def test_saved_jobs_refused_midway_resume_at_the_refused_page(
+        self, mock_page
+    ):
+        mock_page.url = "https://www.linkedin.com/jobs-tracker/?stage=applied"
+        reader = _reader(mock_page)
+        refused = pacing.PacingRefusedError("Rate limit: stopped.", 600)
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_saved_jobs_page",
+                new_callable=AsyncMock,
+                side_effect=[captured(mock_page, extracted("Applied 1")), refused],
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["401"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=3, stage="applied")
+
+        assert result["job_ids"] == ["401"]
+        assert result["pagination"] == {
+            "pages_fetched": 1,
+            "next_cursor": make_cursor(
+                1, "https://www.linkedin.com/jobs-tracker/?stage=applied"
+            ),
+            "reason": "rate_limited",
+        }
+
+    async def test_saved_jobs_resume_where_linkedin_showed_its_rate_limit(
+        self, mock_page
+    ):
+        mock_page.url = "https://www.linkedin.com/jobs-tracker/?stage=saved"
+        reader = _reader(mock_page)
+        asked: list[str] = []
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_saved_jobs_page",
+                side_effect=self._navigating(
+                    mock_page,
+                    [extracted("Saved 1"), extracted(RATE_LIMITED_SECTION_TEXT)],
+                    asked,
+                ),
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["301"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=3)
+
+        assert len(asked) == 2
+        assert result["job_ids"] == ["301"]
+        assert result["section_errors"]["saved_jobs"]["error_type"] == "rate_limit"
+        assert result["pagination"] == {
+            "pages_fetched": 2,
+            "next_cursor": make_cursor(1, result["url"]),
+            "reason": "rate_limited",
+        }

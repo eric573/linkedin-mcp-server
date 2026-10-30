@@ -11,12 +11,12 @@ import re
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.destination import is_linkedin_landing
+from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
 from linkedin_mcp_server.linkedin.capture import (
     CaptureMode,
-    CapturePlan,
     SectionCapture,
 )
 from linkedin_mcp_server.linkedin.contracts import (
@@ -31,6 +31,7 @@ from linkedin_mcp_server.linkedin.identifiers import (
 from linkedin_mcp_server.linkedin.link_metadata import Reference
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
 from linkedin_mcp_server.linkedin.profile_page import ProfilePageReader
+from linkedin_mcp_server.linkedin.paging import walk_result_pages
 from linkedin_mcp_server.linkedin.search_urls import build_people_search_url
 from linkedin_mcp_server.linkedin.session import PageSession
 from linkedin_mcp_server.linkedin.text import SIDEBAR_CHROME_EN
@@ -496,8 +497,13 @@ class PersonReader:
         location: str | None = None,
         network: list[str] | None = None,
         current_company: str | None = None,
+        connection_of: str | None = None,
+        *,
+        max_pages: int = 1,
+        first_page: int = 1,
+        tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        """Search for people and extract the results page.
+        """Search for people and read result pages, ten people each.
 
         Args:
             keywords: Free-text query ("software engineer", "recruiter at Google").
@@ -519,42 +525,43 @@ class PersonReader:
                 unfiltered result set. Look up a company's URN via
                 ``get_company_profile`` -- it is exposed under
                 ``references["about"]``.
+            connection_of: Optional member profile URN id, the
+                ``profile_urn`` ``get_person_profile`` returns: only that
+                member's connections. LinkedIn shows them only for your own
+                connections, and only when they have not hidden the list.
+            max_pages: Result pages to read in this call.
+            first_page: The result page to start from, from a cursor.
+            tool_timeout: What is left of the tool's timeout.
 
         Returns:
-            {url, sections: {name: text}}
+            {url, sections: {search_results}, references?, section_errors?,
+            pagination?}; see ``paging.walk_result_pages``.
         """
         # Builds before it navigates, and the builder refuses a filter
         # LinkedIn would swallow, so an invalid token costs no page load.
-        url = build_people_search_url(
+        build_people_search_url(
             keywords,
             location=location,
             network=network,
             current_company=current_company,
-        )
-        extracted = await self._capture.capture(
-            url,
-            section_name="search_results",
-            plan=CapturePlan(CaptureMode.SEARCH_RESULTS),
+            connection_of=connection_of,
         )
 
-        sections: dict[str, str] = {}
-        references: dict[str, list[Reference]] = {}
-        section_errors: dict[str, dict[str, Any]] = {}
-        if extracted.text and extracted.text != RATE_LIMITED_SECTION_TEXT:
-            sections["search_results"] = extracted.text
-            if extracted.references:
-                references["search_results"] = extracted.references
-        elif extracted.text == RATE_LIMITED_SECTION_TEXT:
-            section_errors["search_results"] = rate_limited_section_error()
-        elif extracted.error:
-            section_errors["search_results"] = extracted.error
+        def page_url(page: int) -> str:
+            return build_people_search_url(
+                keywords,
+                location=location,
+                network=network,
+                current_company=current_company,
+                connection_of=connection_of,
+                page=page,
+            )
 
-        result: dict[str, Any] = {
-            "url": url,
-            "sections": sections,
-        }
-        if references:
-            result["references"] = references
-        if section_errors:
-            result["section_errors"] = section_errors
-        return result
+        return await walk_result_pages(
+            self._capture,
+            page_url,
+            result_kind="person",
+            first_page=first_page,
+            max_pages=max_pages,
+            tool_timeout=tool_timeout,
+        )

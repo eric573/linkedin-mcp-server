@@ -54,7 +54,7 @@
       },
       "get_saved_jobs": {
         "coroutine": true,
-        "signature": "(self, max_pages: 'int' = 3, stage: 'JobsTrackerStage' = 'saved') -> 'dict[str, Any]'"
+        "signature": "(self, max_pages: 'int' = 3, stage: 'JobsTrackerStage' = 'saved', *, first_page: 'int' = 0) -> 'dict[str, Any]'"
       },
       "get_sidebar_profiles": {
         "coroutine": true,
@@ -74,7 +74,7 @@
       },
       "search_companies": {
         "coroutine": true,
-        "signature": "(self, keywords: 'str') -> 'dict[str, Any]'"
+        "signature": "(self, keywords: 'str', *, max_pages: 'int' = 1, first_page: 'int' = 1, tool_timeout: 'float' = 180.0) -> 'dict[str, Any]'"
       },
       "search_conversations": {
         "coroutine": true,
@@ -82,11 +82,11 @@
       },
       "search_jobs": {
         "coroutine": true,
-        "signature": "(self, keywords: 'str', location: 'str | None' = None, max_pages: 'int' = 3, date_posted: 'str | None' = None, job_type: 'str | None' = None, experience_level: 'str | None' = None, work_type: 'str | None' = None, easy_apply: 'bool' = False, sort_by: 'str | None' = None, tool_timeout: 'float' = 180.0) -> 'dict[str, Any]'"
+        "signature": "(self, keywords: 'str', location: 'str | None' = None, max_pages: 'int' = 3, date_posted: 'str | None' = None, job_type: 'str | None' = None, experience_level: 'str | None' = None, work_type: 'str | None' = None, easy_apply: 'bool' = False, sort_by: 'str | None' = None, tool_timeout: 'float' = 180.0, first_offset: 'int' = 0) -> 'dict[str, Any]'"
       },
       "search_people": {
         "coroutine": true,
-        "signature": "(self, keywords: 'str', location: 'str | None' = None, network: 'list[str] | None' = None, current_company: 'str | None' = None) -> 'dict[str, Any]'"
+        "signature": "(self, keywords: 'str', location: 'str | None' = None, network: 'list[str] | None' = None, current_company: 'str | None' = None, connection_of: 'str | None' = None, *, max_pages: 'int' = 1, first_page: 'int' = 1, tool_timeout: 'float' = 180.0) -> 'dict[str, Any]'"
       },
       "search_posts": {
         "coroutine": true,
@@ -461,6 +461,18 @@
         "input": {
           "additionalProperties": false,
           "properties": {
+            "cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "pagination.next_cursor from an earlier call for the same\nstage, to continue where it stopped."
+            },
             "max_pages": {
               "default": 3,
               "description": "Maximum number of tracker pages to load (1-10, default 3)",
@@ -521,9 +533,28 @@
         "input": {
           "additionalProperties": false,
           "properties": {
+            "cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "pagination.next_cursor from an earlier call with the same\nkeywords, to continue where it stopped."
+            },
             "keywords": {
               "description": "Search keywords (e.g., \"fintech\", \"anthropic\", \"electric vehicles\")",
               "type": "string"
+            },
+            "max_pages": {
+              "default": 1,
+              "description": "Result pages to read in this call (1-10, default 1).\nEach is a page load against the account's rate limit.",
+              "maximum": 10,
+              "minimum": 1,
+              "type": "integer"
             }
           },
           "required": [
@@ -566,6 +597,18 @@
         "input": {
           "additionalProperties": false,
           "properties": {
+            "cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "pagination.next_cursor from an earlier call with the same\nkeywords and filters, to continue where it stopped."
+            },
             "date_posted": {
               "anyOf": [
                 {
@@ -669,6 +712,18 @@
         "input": {
           "additionalProperties": false,
           "properties": {
+            "connection_of": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional member filter: only that member's\nconnections. The member's profile URN id (e.g. \"ACoAAB...\"),\nwhich get_person_profile returns as profile_urn; a username is\nrefused, because LinkedIn ignores it. LinkedIn decides how much\nof the list it shows: a member can hide their connections, and\nfor someone you are not connected to it may show only the\nconnections you share. Combine with network to narrow it."
+            },
             "current_company": {
               "anyOf": [
                 {
@@ -681,9 +736,29 @@
               "default": null,
               "description": "Optional current-employer filter. LinkedIn's\ncurrentCompany facet only filters on the numeric company URN id\n(e.g. \"1115\" for SAP); plain company names are accepted by the\nURL but ignored by LinkedIn and return the unfiltered result\nset. Look up a company's URN via get_company_profile -- it is\nexposed under references[\"about\"]. For company-wide employee\ndemographics (location/education/function breakdown) plus a\nslug-based lookup, use get_company_employees instead."
             },
+            "cursor": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "pagination.next_cursor from an earlier call with the same\nkeywords and filters, to continue where it stopped. A cursor\nfrom a different search is refused."
+            },
             "keywords": {
-              "description": "Search keywords (e.g., \"software engineer\", \"recruiter at Google\")",
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Search keywords (e.g., \"software engineer\", \"recruiter at\nGoogle\"). Optional when any filter below is given."
             },
             "location": {
               "anyOf": [
@@ -696,6 +771,13 @@
               ],
               "default": null,
               "description": "Optional location filter, as LinkedIn's numeric geo URN\nid (e.g., \"103644278\" for the United States). Plain-text place\nnames are silently ignored by LinkedIn and return unfiltered\nresults, so they are refused here. The id is the geoUrn value\nin the URL of a LinkedIn people search filtered to that place;\nwithout one, put the place in keywords instead."
+            },
+            "max_pages": {
+              "default": 1,
+              "description": "Result pages to read in this call (1-10, default 1).",
+              "maximum": 10,
+              "minimum": 1,
+              "type": "integer"
             },
             "network": {
               "anyOf": [
@@ -713,9 +795,6 @@
               "description": "Optional connection-degree filter. Each element is one of\n\"F\" (1st-degree), \"S\" (2nd-degree), \"O\" (3rd-degree and beyond).\nExample: [\"F\"] to only return 1st-degree connections. A single\ntoken (\"F\") or a comma-separated string (\"F,S\") is also\naccepted, for clients that cannot transmit an array."
             }
           },
-          "required": [
-            "keywords"
-          ],
           "type": "object"
         },
         "output": {

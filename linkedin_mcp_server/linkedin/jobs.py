@@ -29,7 +29,6 @@ from linkedin_mcp_server.linkedin.job_policy import (
     RESULTS_PER_LINKEDIN_PAGE,
     SAVED_JOBS_PAGE_SIZE,
     SAVED_JOBS_PATHS,
-    SAVED_JOBS_URL,
     SCROLL_BUDGET_TOTAL,
     SCROLL_DEADLINE_MAX,
     SEARCH_TIMEOUT_FRACTION,
@@ -43,10 +42,11 @@ from linkedin_mcp_server.linkedin.job_policy import (
     no_matching_jobs_section_error,
     posting_state,
     reconcile_search_references,
+    saved_jobs_list_url,
 )
 from linkedin_mcp_server.linkedin.link_metadata import Reference, dedupe_references
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
-from linkedin_mcp_server.linkedin.search_urls import build_job_search_url
+from linkedin_mcp_server.linkedin.search_urls import build_job_search_url, next_cursor
 from linkedin_mcp_server.linkedin.text import (
     JOB_APPLY_EN_US,
     JOB_POSTING_EN_US,
@@ -191,6 +191,7 @@ class JobReader:
         easy_apply: bool = False,
         sort_by: str | None = None,
         tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+        first_offset: int = 0,
     ) -> dict[str, Any]:
         """Search for jobs with pagination and job ID extraction.
 
@@ -208,11 +209,12 @@ class JobReader:
             work_type: Filter by work type (on_site, remote, hybrid)
             easy_apply: Only show Easy Apply jobs
             sort_by: Sort results (date, relevance)
+            first_offset: The ``start`` to begin from, from a cursor.
 
         Returns:
             {url, sections: {search_results: text}, job_ids: [str],
-            pagination: {pages_fetched, next_offset, reason}}. ``pagination``
-            is absent when a failure stopped the search, which
+            pagination: {pages_fetched, next_offset, next_cursor, reason}}.
+            ``pagination`` is absent when a failure stopped the search, which
             ``section_errors`` then explains.
         """
         base_url = build_job_search_url(
@@ -260,8 +262,9 @@ class JobReader:
         # whichever is smaller, and the total is the same 60s.
         scroll_budget_left = SCROLL_BUDGET_TOTAL
         # The offset follows what the pages actually rendered. LinkedIn's own
-        # stride would skip every result it renders beyond it.
-        offset = 0
+        # stride would skip every result it renders beyond it. A cursor resumes
+        # it where an earlier call stopped.
+        offset = first_offset
 
         # The next navigation is costed from the slowest one so far rather than
         # a constant: the real figure is 6.5s and the `goto` timeout alone is
@@ -346,6 +349,7 @@ class JobReader:
                 # is a successful answer to a different search.
                 if extracted.text == RATE_LIMITED_SECTION_TEXT:
                     section_errors["search_results"] = rate_limited_section_error()
+                    stop_reason = "rate_limited"
                     break
                 if not extracted.text and extracted.error:
                     section_errors["search_results"] = extracted.error
@@ -483,7 +487,9 @@ class JobReader:
                         "Search page %d shows recommendations, not results",
                         page_num + 1,
                     )
-                    if not all_job_ids:
+                    # Only for a search read from its start: one resumed past its
+                    # last result did match, on the pages an earlier call read.
+                    if not all_job_ids and first_offset == 0:
                         section_errors["search_results"] = (
                             no_matching_jobs_section_error(keywords)
                         )
@@ -614,6 +620,7 @@ class JobReader:
             result["pagination"] = {
                 "pages_fetched": pages_fetched,
                 "next_offset": offset,
+                "next_cursor": next_cursor(stop_reason, offset, base_url),
                 "reason": stop_reason,
             }
         return result
@@ -646,7 +653,11 @@ class JobReader:
         return organic == 0
 
     async def get_saved_jobs(
-        self, max_pages: int = 3, stage: JobsTrackerStage = "saved"
+        self,
+        max_pages: int = 3,
+        stage: JobsTrackerStage = "saved",
+        *,
+        first_page: int = 0,
     ) -> dict[str, Any]:
         """List the authenticated user's jobs at one job-tracker stage.
 
@@ -657,11 +668,14 @@ class JobReader:
         Args:
             max_pages: Maximum pages to load (1-10, default 3)
             stage: Tracker tab to read: saved, in_progress, applied, archived
+            first_page: The page index to begin from, from a cursor.
 
         Returns:
-            {url, sections: {saved_jobs: text}, job_ids: [str]}
+            {url, sections: {saved_jobs: text}, job_ids: [str],
+            pagination?: {pages_fetched, next_cursor, reason}}, where
+            ``pagination`` is absent when a failure stopped the list.
         """
-        base_url = f"{SAVED_JOBS_URL}?stage={stage}"
+        base_url = saved_jobs_list_url(stage)
         all_job_ids: list[str] = []
         seen_ids: set[str] = set()
         page_texts: list[str] = []
@@ -669,10 +683,16 @@ class JobReader:
         section_errors: dict[str, dict[str, Any]] = {}
         total_pages: int | None = None
         total_pages_queried = False
+        # Why the list stopped, as in job search: unset by a failure, whose
+        # `section_errors` entry explains it instead.
+        stop_reason: str | None = None
+        pages_fetched = 0
+        page_num = first_page
 
-        for page_num in range(max_pages):
+        for page_num in range(first_page, first_page + max_pages):
             if total_pages is not None and page_num >= total_pages:
                 logger.debug("All %d saved-jobs pages fetched, stopping", total_pages)
+                stop_reason = "complete"
                 break
 
             url = (
@@ -686,6 +706,7 @@ class JobReader:
                     url, section_name="saved_jobs"
                 )
                 extracted = capture.section
+                pages_fetched += 1
 
                 # Rate limit first: it is the more specific diagnosis, and a
                 # page that was throttled may carry a generic error too. Then
@@ -693,6 +714,7 @@ class JobReader:
                 # would be masked by the route guard below.
                 if extracted.text == RATE_LIMITED_SECTION_TEXT:
                     section_errors["saved_jobs"] = rate_limited_section_error()
+                    stop_reason = "rate_limited"
                     break
                 if extracted.error:
                     section_errors["saved_jobs"] = extracted.error
@@ -732,6 +754,7 @@ class JobReader:
                 if not extracted.text:
                     # Nothing to read, and the page is the one that was asked
                     # for: an account with nothing saved.
+                    stop_reason = "complete"
                     break
 
                 if not total_pages_queried:
@@ -795,6 +818,7 @@ class JobReader:
                     logger.debug(
                         "No new saved job IDs on page %d, stopping", page_num + 1
                     )
+                    stop_reason = "no_new_ids"
                     break
 
                 for jid in new_ids:
@@ -814,6 +838,7 @@ class JobReader:
                 section_errors["saved_jobs"] = rate_limited_section_error(
                     str(refused), retry_after=refused.retry_after
                 )
+                stop_reason = "rate_limited"
                 break
             except LinkedInOperationError:
                 raise
@@ -826,6 +851,14 @@ class JobReader:
                     section_name="saved_jobs",
                 )
                 break
+        else:
+            page_num += 1
+            # The last page LinkedIn has was read: a cursor would only buy a
+            # navigation to a page that is not there.
+            if total_pages is not None and page_num >= total_pages:
+                stop_reason = "complete"
+            else:
+                stop_reason = "max_pages"
 
         result: dict[str, Any] = {
             "url": base_url,
@@ -840,4 +873,11 @@ class JobReader:
             }
         if section_errors:
             result["section_errors"] = section_errors
+        if stop_reason is not None:
+            result["pagination"] = {
+                "pages_fetched": pages_fetched,
+                # The page index the next call starts from: the one not read.
+                "next_cursor": next_cursor(stop_reason, page_num, base_url),
+                "reason": stop_reason,
+            }
         return result

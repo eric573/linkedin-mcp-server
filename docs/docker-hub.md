@@ -13,11 +13,11 @@ A Model Context Protocol (MCP) server that connects AI assistants to LinkedIn. A
 - **Messaging**: List the inbox, read a conversation by username or thread ID, search messages by keyword, and compose/send a new message with explicit confirmation (profile-based send may open a separate DM rather than reply in an existing thread)
 - **Company Profiles**: Extract comprehensive company data, including the LinkedIn company URN id (used by LinkedIn's people-search `currentCompany` URL facet)
 - **Company Employees**: List employees at a company with optional keyword filtering
-- **Company Search**: Search for companies by keyword
+- **Company Search**: Search for companies by keyword, one or more result pages at a time, with a cursor to continue
 - **Job Details**: Retrieve job posting information
-- **Job Search**: Search for jobs with keywords and location filters
-- **Saved Jobs**: List job postings saved by the authenticated user
-- **People Search**: Search for people by keywords and location
+- **Job Search**: Search for jobs with keywords and location filters, with a cursor to continue
+- **Saved Jobs**: List job postings saved by the authenticated user, with a cursor to continue
+- **People Search**: Search for people by keywords, location, connection degree, current company or a member's connections, one or more result pages at a time, with a cursor to continue
 - **Person Posts**: Get recent activity/posts from a person's profile
 - **Company Posts**: Get recent posts from a company's LinkedIn feed
 - **Home Feed**: Get recent posts from the authenticated user's LinkedIn home feed

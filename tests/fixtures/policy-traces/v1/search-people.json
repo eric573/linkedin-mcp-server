@@ -103,6 +103,11 @@
     }
   ],
   "result": {
+    "pagination": {
+      "next_cursor": null,
+      "pages_fetched": 1,
+      "reason": "complete"
+    },
     "section_names": [
       "search_results"
     ],

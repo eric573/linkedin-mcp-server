@@ -174,6 +174,7 @@ class LinkedInExtractor:
         easy_apply: bool = False,
         sort_by: str | None = None,
         tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+        first_offset: int = 0,
     ) -> dict[str, Any]:
         """Search for jobs with pagination and job ID extraction."""
         return await self._jobs.search_jobs(
@@ -187,13 +188,18 @@ class LinkedInExtractor:
             easy_apply,
             sort_by,
             tool_timeout,
+            first_offset,
         )
 
     async def get_saved_jobs(
-        self, max_pages: int = 3, stage: JobsTrackerStage = "saved"
+        self,
+        max_pages: int = 3,
+        stage: JobsTrackerStage = "saved",
+        *,
+        first_page: int = 0,
     ) -> dict[str, Any]:
         """List the authenticated user's jobs at one job-tracker stage."""
-        return await self._jobs.get_saved_jobs(max_pages, stage)
+        return await self._jobs.get_saved_jobs(max_pages, stage, first_page=first_page)
 
     async def search_people(
         self,
@@ -201,18 +207,39 @@ class LinkedInExtractor:
         location: str | None = None,
         network: list[str] | None = None,
         current_company: str | None = None,
+        connection_of: str | None = None,
+        *,
+        max_pages: int = 1,
+        first_page: int = 1,
+        tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        """Search for people and extract the results page."""
+        """Search for people and extract the result pages."""
         return await self._person.search_people(
             keywords,
             location=location,
             network=network,
             current_company=current_company,
+            connection_of=connection_of,
+            max_pages=max_pages,
+            first_page=first_page,
+            tool_timeout=tool_timeout,
         )
 
-    async def search_companies(self, keywords: str) -> dict[str, Any]:
-        """Search for companies and extract the results page."""
-        return await self._company.search_companies(keywords)
+    async def search_companies(
+        self,
+        keywords: str,
+        *,
+        max_pages: int = 1,
+        first_page: int = 1,
+        tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Search for companies and extract the result pages."""
+        return await self._company.search_companies(
+            keywords,
+            max_pages=max_pages,
+            first_page=first_page,
+            tool_timeout=tool_timeout,
+        )
 
     async def search_posts(
         self,

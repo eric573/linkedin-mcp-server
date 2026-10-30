@@ -14,7 +14,11 @@ from pydantic import Field
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.dependencies import get_ready_extractor, tool_errors
 from linkedin_mcp_server.linkedin.identifiers import normalize_job_id
-from linkedin_mcp_server.linkedin.job_policy import JobsTrackerStage
+from linkedin_mcp_server.linkedin.job_policy import (
+    JobsTrackerStage,
+    saved_jobs_list_url,
+)
+from linkedin_mcp_server.linkedin.search_urls import build_job_search_url, read_cursor
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +129,7 @@ def register_job_tools(
         work_type: str | None = None,
         easy_apply: bool = False,
         sort_by: str | None = None,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """
         Search for jobs on LinkedIn.
@@ -150,6 +155,8 @@ def register_job_tools(
             work_type: Filter by work type, comma-separated (on_site, remote, hybrid). Classic search only.
             easy_apply: Only show Easy Apply jobs (default false). Classic search only.
             sort_by: Sort results (date, relevance). Classic search only.
+            cursor: pagination.next_cursor from an earlier call with the same
+                keywords and filters, to continue where it stopped.
 
         Returns:
             Dict with url, sections (name -> raw text), job_ids (list of
@@ -161,11 +168,15 @@ def register_job_tools(
             A search with no matches returns empty job_ids and a
             section_errors entry of type no_matching_jobs, rather than the
             unrelated recommendations LinkedIn shows in its place.
-            pagination ({pages_fetched, next_offset, reason}) says why paging
-            stopped: complete (the results ran out), max_pages, time_budget
-            (the tool timeout was near, so more results may exist) or
-            no_new_ids (a page repeated earlier results). It is absent when a
-            failure stopped the search, which section_errors then explains.
+            pagination ({pages_fetched, next_offset, next_cursor, reason}) says
+            why paging stopped: complete (the results ran out), max_pages,
+            time_budget (the tool timeout was near, so more results may
+            exist), rate_limited (the account's rate limit or LinkedIn stopped
+            it; section_errors says when to retry) or no_new_ids (a page
+            repeated earlier results). next_cursor continues the search and is
+            set only after max_pages, time_budget or rate_limited. It is absent
+            when a failure stopped the search, which section_errors then
+            explains.
         """
         # Before the browser, because FastMCP is already timing this call
         # and the extractor's budget is a fraction of the same figure. A
@@ -173,6 +184,22 @@ def register_job_tools(
         # against eight it no longer had, and the call was cancelled with
         # every page it had gathered.
         started = time.monotonic()
+        # Refused before the browser too: a cursor from another search would
+        # page through results nobody asked for.
+        first_offset = read_cursor(
+            cursor,
+            build_job_search_url(
+                keywords,
+                location=location,
+                date_posted=date_posted,
+                job_type=job_type,
+                experience_level=experience_level,
+                work_type=work_type,
+                easy_apply=easy_apply,
+                sort_by=sort_by,
+            ),
+            first=0,
+        )
         extractor = await get_ready_extractor(ctx, tool_name="search_jobs")
         logger.info(
             "Searching jobs: keywords='%s', location='%s', max_pages=%d",
@@ -195,6 +222,7 @@ def register_job_tools(
             sort_by=sort_by,
             # What is left of the figure FastMCP cancels this call on.
             tool_timeout=max(0.0, tool_timeout - (time.monotonic() - started)),
+            first_offset=first_offset,
         )
 
         await ctx.report_progress(progress=100, total=100, message="Complete")
@@ -212,6 +240,7 @@ def register_job_tools(
         ctx: Context,
         max_pages: Annotated[int, Field(ge=1, le=10)] = 3,
         stage: JobsTrackerStage = "saved",
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """
         List the authenticated user's jobs at one stage of LinkedIn's job tracker.
@@ -224,17 +253,33 @@ def register_job_tools(
             stage: Tracker tab: saved (default), in_progress, applied or
                 archived. applied lists Easy Apply submissions and external
                 applications the user confirmed to LinkedIn.
+            cursor: pagination.next_cursor from an earlier call for the same
+                stage, to continue where it stopped.
 
         Returns:
             Dict with url, sections (name -> raw text), job_ids (list of
             numeric job ID strings usable with get_job_details), and optional references.
+            pagination ({pages_fetched, next_cursor, reason}) says why paging
+            stopped, as in search_jobs: next_cursor is set only after
+            max_pages, time_budget or rate_limited. It is absent when a
+            failure stopped the list, which section_errors then explains.
         """
+        # Refused before the browser: a cursor from another stage would read
+        # pages of a list nobody asked for.
+        first_page = read_cursor(cursor, saved_jobs_list_url(stage), first=0)
         extractor = await get_ready_extractor(ctx, tool_name="get_saved_jobs")
-        logger.info("Fetching %s jobs (max_pages=%d)", stage, max_pages)
+        logger.info(
+            "Fetching %s jobs (max_pages=%d, from page %d)",
+            stage,
+            max_pages,
+            first_page,
+        )
 
         await ctx.report_progress(progress=0, total=100, message="Loading saved jobs")
 
-        result = await extractor.get_saved_jobs(max_pages=max_pages, stage=stage)
+        result = await extractor.get_saved_jobs(
+            max_pages=max_pages, stage=stage, first_page=first_page
+        )
 
         await ctx.report_progress(progress=100, total=100, message="Complete")
 

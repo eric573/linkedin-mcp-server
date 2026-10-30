@@ -7,6 +7,7 @@ from urllib.parse import quote_plus
 
 import logging
 
+from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
@@ -25,6 +26,7 @@ from linkedin_mcp_server.linkedin.identifiers import (
     normalize_company_identifier,
 )
 from linkedin_mcp_server.linkedin.link_metadata import Reference
+from linkedin_mcp_server.linkedin.paging import walk_result_pages
 from linkedin_mcp_server.linkedin.search_urls import build_company_search_url
 from linkedin_mcp_server.linkedin.session import PageSession
 
@@ -191,37 +193,22 @@ class CompanyReader:
     async def search_companies(
         self,
         keywords: str,
+        *,
+        max_pages: int = 1,
+        first_page: int = 1,
+        tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
-        """Search for companies and extract the results page.
+        """Search for companies and read result pages, ten companies each.
 
         Returns:
-            {url, sections: {search_results: text}}
+            {url, sections: {search_results}, references?, section_errors?,
+            pagination?}; see ``paging.walk_result_pages``.
         """
-        url = build_company_search_url(keywords)
-        extracted = await self._capture.capture(
-            url,
-            "search_results",
-            CapturePlan(CaptureMode.SEARCH_RESULTS),
+        return await walk_result_pages(
+            self._capture,
+            lambda page: build_company_search_url(keywords, page=page),
+            result_kind="company",
+            first_page=first_page,
+            max_pages=max_pages,
+            tool_timeout=tool_timeout,
         )
-
-        sections: dict[str, str] = {}
-        references: dict[str, list[Reference]] = {}
-        section_errors: dict[str, dict[str, Any]] = {}
-        if extracted.text and extracted.text != RATE_LIMITED_SECTION_TEXT:
-            sections["search_results"] = extracted.text
-            if extracted.references:
-                references["search_results"] = extracted.references
-        elif extracted.text == RATE_LIMITED_SECTION_TEXT:
-            section_errors["search_results"] = rate_limited_section_error()
-        elif extracted.error:
-            section_errors["search_results"] = extracted.error
-
-        result: dict[str, Any] = {
-            "url": url,
-            "sections": sections,
-        }
-        if references:
-            result["references"] = references
-        if section_errors:
-            result["section_errors"] = section_errors
-        return result

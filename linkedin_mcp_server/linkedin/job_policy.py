@@ -257,6 +257,12 @@ JobsTrackerStage = Literal["saved", "in_progress", "applied", "archived"]
 # list and yields nothing.
 SAVED_JOBS_PAGE_SIZE = 10
 
+
+def saved_jobs_list_url(stage: JobsTrackerStage) -> str:
+    """The first tracker page for *stage*; later pages add ``&start=``."""
+    return f"{SAVED_JOBS_URL}?stage={stage}"
+
+
 ApplyType = Literal["easy_apply", "external", "applied", "closed", "unknown"]
 
 

@@ -7,6 +7,7 @@ with configurable section selection.
 
 import json
 import logging
+import time
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
@@ -19,7 +20,10 @@ from linkedin_mcp_server.error_handler import CodedToolError, ErrorCode
 from linkedin_mcp_server.linkedin import parse_person_sections
 from linkedin_mcp_server.linkedin.contracts import FilterValidationError
 from linkedin_mcp_server.linkedin.identifiers import normalize_person_identifier
-from linkedin_mcp_server.linkedin.search_urls import build_people_search_url
+from linkedin_mcp_server.linkedin.search_urls import (
+    build_people_search_url,
+    read_cursor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,18 +139,28 @@ def register_person_tools(
     )
     @tool_errors
     async def search_people(
-        keywords: str,
         ctx: Context,
+        keywords: str | None = None,
         location: str | None = None,
         network: StrList | None = None,
         current_company: str | None = None,
+        connection_of: str | None = None,
+        max_pages: Annotated[int, Field(ge=1, le=10)] = 1,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         """
-        Search for people on LinkedIn.
+        Search for people on LinkedIn, ten per result page.
+
+        Lists a company's employees with current_company, and a member's
+        connections with connection_of; keywords are optional when a filter
+        is given. Every page is a page load against the account's rate limit,
+        so ask for more pages only when the first ones did not answer the
+        question.
 
         Args:
-            keywords: Search keywords (e.g., "software engineer", "recruiter at Google")
             ctx: FastMCP context for progress reporting
+            keywords: Search keywords (e.g., "software engineer", "recruiter at
+                Google"). Optional when any filter below is given.
             location: Optional location filter, as LinkedIn's numeric geo URN
                 id (e.g., "103644278" for the United States). Plain-text place
                 names are silently ignored by LinkedIn and return unfiltered
@@ -166,31 +180,72 @@ def register_person_tools(
                 exposed under references["about"]. For company-wide employee
                 demographics (location/education/function breakdown) plus a
                 slug-based lookup, use get_company_employees instead.
+            connection_of: Optional member filter: only that member's
+                connections. The member's profile URN id (e.g. "ACoAAB..."),
+                which get_person_profile returns as profile_urn; a username is
+                refused, because LinkedIn ignores it. LinkedIn decides how much
+                of the list it shows: a member can hide their connections, and
+                for someone you are not connected to it may show only the
+                connections you share. Combine with network to narrow it.
+            max_pages: Result pages to read in this call (1-10, default 1).
+            cursor: pagination.next_cursor from an earlier call with the same
+                keywords and filters, to continue where it stopped. A cursor
+                from a different search is refused.
 
         Returns:
-            Dict with url, sections (name -> raw text), and optional references.
-            The LLM should parse the raw text to extract individual people and their profiles.
+            Dict with url, sections (search_results -> raw text of every page
+            read, joined by "---"), and optional references. The LLM should
+            parse the raw text to extract individual people and their profiles.
+            pagination ({pages_fetched, next_cursor, reason}) says why reading
+            stopped: complete (no more results), no_new_results (LinkedIn
+            served results already returned), max_pages, time_budget (the tool
+            timeout was near) or rate_limited (the account's rate limit or
+            LinkedIn stopped it; section_errors says when to retry). Only the
+            last three come with a next_cursor, and more results may exist.
+            pagination is absent when a failure stopped the search, which
+            section_errors then explains.
         """
+        # Before the browser, as in search_jobs: the extractor's time budget
+        # is what is left of the figure FastMCP cancels this call on.
+        started = time.monotonic()
+        terms = keywords or ""
+        if not terms.strip() and not (
+            location or network or current_company or connection_of
+        ):
+            raise CodedToolError(
+                "Give keywords, a filter (location, network, current_company, "
+                "connection_of), or both. A search with neither lists people "
+                "LinkedIn picks, at the cost of a page load each.",
+                ErrorCode.INVALID_ARGUMENT,
+            )
         try:
             # The builder refuses a filter LinkedIn would ignore. Doing it here
             # keeps that refusal off the browser: get_ready_extractor can install
             # Chromium or rotate a login before this call would have failed.
-            build_people_search_url(
-                keywords,
+            search_url = build_people_search_url(
+                terms,
                 location=location,
                 network=network,
                 current_company=current_company,
+                connection_of=connection_of,
             )
         except FilterValidationError as e:
             raise CodedToolError(str(e), ErrorCode.INVALID_ARGUMENT) from e
+        # A cursor from another search would page through results nobody asked
+        # for, so it is refused here, before a page is spent on it.
+        first_page = read_cursor(cursor, search_url, first=1)
 
         extractor = await get_ready_extractor(ctx, tool_name="search_people")
         logger.info(
-            "Searching people: keywords='%s', location='%s', network=%s, current_company='%s'",
-            keywords,
+            "Searching people: keywords='%s', location='%s', network=%s, "
+            "current_company='%s', connection_of='%s', pages %d-%d",
+            terms,
             location,
             network,
             current_company,
+            connection_of,
+            first_page,
+            first_page + max_pages - 1,
         )
 
         await ctx.report_progress(
@@ -199,10 +254,15 @@ def register_person_tools(
 
         try:
             result = await extractor.search_people(
-                keywords,
+                terms,
                 location,
                 network=network,
                 current_company=current_company,
+                connection_of=connection_of,
+                max_pages=max_pages,
+                first_page=first_page,
+                # What is left of the figure FastMCP cancels this call on.
+                tool_timeout=max(0.0, tool_timeout - (time.monotonic() - started)),
             )
         except FilterValidationError as e:
             # Validation messages carry actionable detail; surface
