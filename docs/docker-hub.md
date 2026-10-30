@@ -134,7 +134,7 @@ Use `$env:USERPROFILE\.linkedin-mcp` when constructing the host path outside JSO
 | `BROWSER_MIN_HOLD` | `20` | Shortest time a process keeps the shared browser before handing it over, in seconds. Clamped to 3 seconds below `BROWSER_WAIT`, so raise that one along with it. Higher means fewer browser restarts but longer waits for other clients. |
 | `BROWSER_IDLE_TIMEOUT` | `600` | Close an idle browser and release the profile after this many seconds without a tool call (`0` = keep it open). |
 | `AUTO_IMPORT_FROM_BROWSER` | on | Import a session from a signed-in local browser on the first tool call that needs one. Skipped in containers, which have no host browser or keychain. |
-| `RATE_LIMIT_PAUSE_SECONDS` | `3-6` | Pause before each LinkedIn page visit, in seconds: one number or a range drawn from at random. One budget covers every tool; details under [Rate limiting](https://github.com/stickerdaniel/linkedin-mcp-server#rate-limiting). |
+| `RATE_LIMIT_PAUSE_SECONDS` | `3-6` | Pause before each LinkedIn page visit, in seconds: one number or a range drawn from at random. Conversations opened in a row wait half of it, at least 1.5-3 s. One budget covers every tool; details under [Rate limiting](https://github.com/stickerdaniel/linkedin-mcp-server#rate-limiting). |
 | `RATE_LIMIT_VISITS_PER_HOUR` / `RATE_LIMIT_VISITS_PER_DAY` | `60` / `300` | Page visits in any hour / any 24 hours. Opening a conversation counts as one, and five scrolls that load more count as one. `0` turns a limit off. |
 | `RATE_LIMIT_INVITES_PER_DAY` / `RATE_LIMIT_INVITES_PER_WEEK` | `20` / `100` | Connection invitations sent, counted at the click. |
 | `RATE_LIMIT_MESSAGES_PER_DAY` | `50` | Messages sent. |

@@ -1348,7 +1348,12 @@ class TestTheClickLoopIsPaced:
         # Short enough for a test, long enough that timer slack cannot fake it.
         monkeypatch.setattr(pacing, "CONVERSATION_PAUSE_SECONDS", (0.2, 0.2))
         gate = pacing.Pacing(
-            RateLimitConfig(visits_per_hour=2, visits_per_day=0),
+            RateLimitConfig(
+                visits_per_hour=2,
+                visits_per_day=0,
+                pause_min_seconds=0.4,
+                pause_max_seconds=0.4,
+            ),
             profile_dir.parent / "rate-limit.json",
         )
         pacing.install_gate(gate)

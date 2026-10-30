@@ -388,6 +388,25 @@ class TestDeadline:
             with pytest.raises(PacingRefusedError, match="no time left"):
                 await gate.before_visit(_PROFILE, deadline=clock.mono + 12)
 
+    @pytest.mark.parametrize(
+        ("pause", "low", "high"),
+        [((3.0, 6.0), 1.5, 3.0), ((10.0, 20.0), 5.0, 10.0)],
+        ids=["default", "slower"],
+    )
+    async def test_conversation_opens_slow_down_with_the_page_pause(
+        self, clock, record_path, pause, low, high
+    ):
+        """Half the page pause between opens, and never less than 1.5-3 s."""
+        for fraction, expected in ((0.0, low), (1.0, high)):
+            gate = make_gate(
+                clock,
+                record_path,
+                fraction=fraction,
+                pause_min_seconds=pause[0],
+                pause_max_seconds=pause[1],
+            )
+            assert gate.conversation_pause() == pytest.approx(expected)
+
     async def test_conversations_opened_stop_where_the_call_runs_out_of_time(
         self, clock, record_path
     ):
@@ -527,14 +546,17 @@ class TestStops:
         assert gate.stop_seconds_left() == pytest.approx(1800)
 
     async def test_doubling_never_runs_past_a_day(self, clock, record_path):
+        """Each stop starts as the one before ends, so each is a repeat."""
         gate = make_gate(clock, record_path)
-        for _ in range(12):
+        lengths = []
+        for _ in range(9):
             gate.record_pushback("http_429")
+            lengths.append(gate._record.stop_until - clock.now)
             clock.advance(gate.stop_seconds_left() + 1)
-            # Keep every stop inside one rolling day.
-            clock.now -= gate.stop_seconds_left()
-        gate.record_pushback("http_429")
-        assert gate.stop_seconds_left() <= 86400
+        assert lengths == [
+            pytest.approx(length)
+            for length in (900, 1800, 3600, 7200, 14400, 28800, 57600, 86400, 86400)
+        ]
 
     @pytest.mark.parametrize(
         ("kind", "stop"),
@@ -985,7 +1007,17 @@ class TestEveryPageVisitIsPaced:
                 if not names & _NAVIGATIONS:
                     continue
                 navigating.add(relative)
-                if relative not in self.ALLOWED and "before_visit" not in names:
+                # Both halves: without `after_visit` the pause before the
+                # next visit runs from an earlier page, and that visit loads
+                # right behind this one.
+                if (
+                    relative not in self.ALLOWED
+                    and not {
+                        "before_visit",
+                        "after_visit",
+                    }
+                    <= names
+                ):
                     unpaced.append(f"{relative}:{function.name}")
 
         assert unpaced == []

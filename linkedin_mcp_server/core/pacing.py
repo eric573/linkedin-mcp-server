@@ -74,7 +74,9 @@ LOAD_WEIGHT = 0.2
 _LOAD_PAUSE_FLOOR_SECONDS = 1.0
 #: ...and is stretched by a random factor from this range.
 _LOAD_PAUSE_JITTER = (1.0, 1.5)
-#: The pause before opening each conversation, drawn from this range.
+#: The pause before opening each conversation, drawn from this range, or from
+#: half the configured page pause when that is longer: a thread loads less
+#: than a page, and a slower page pause slows the opens with it.
 CONVERSATION_PAUSE_SECONDS = (1.5, 3.0)
 #: What opening one conversation takes besides its pause: the click settling.
 _CONVERSATION_OPEN_SECONDS = 1.2
@@ -869,7 +871,9 @@ class Pacing:
         scope = _scope.get()
         if scope is not None and scope.deadline is not None:
             left = scope.deadline - self._clock.monotonic() - _PAGE_RESERVE_SECONDS
-            each = sum(CONVERSATION_PAUSE_SECONDS) / 2 + _CONVERSATION_OPEN_SECONDS
+            each = (
+                sum(self._conversation_pause_range()) / 2 + _CONVERSATION_OPEN_SECONDS
+            )
             allowed = min(allowed, max(0.0, left) / each)
         if math.isinf(allowed):
             return wanted
@@ -910,7 +914,15 @@ class Pacing:
         so the clicks keep no fixed rhythm."""
         if not self.enabled:
             return 0.0
-        return self._rng.uniform(*CONVERSATION_PAUSE_SECONDS)
+        return self._rng.uniform(*self._conversation_pause_range())
+
+    def _conversation_pause_range(self) -> tuple[float, float]:
+        assert self._settings is not None
+        low, high = CONVERSATION_PAUSE_SECONDS
+        return (
+            max(low, self._settings.pause_min_seconds / 2),
+            max(high, self._settings.pause_max_seconds / 2),
+        )
 
     def record_conversation_opens(self, count: int) -> None:
         """Count *count* conversations opened, or clicked open.
@@ -1012,9 +1024,9 @@ class Pacing:
     ) -> None:
         """Stop every LinkedIn request for a while, because LinkedIn asked.
 
-        Each stop that starts within a day of the one before lasts twice as
-        long as that one, so pushback that keeps coming backs off further
-        however far apart it is spaced. Signals that arrive while a stop runs
+        Each stop that starts within a day of the end of the one before lasts
+        twice as long as that one, so pushback that keeps coming backs off
+        further however it is spaced, up to a day. Signals that arrive while a stop runs
         extend it by its own length rather than counting as a repeat, so one
         burst of refusals is one stop. LinkedIn's ``Retry-After`` wins when it
         asks for longer, up to the longest stop there is.
@@ -1042,8 +1054,9 @@ class Pacing:
                 length = base
             elif active:
                 length = min(max(base, record.stop_length), doubled)
-            elif record.stops_started:
-                # `stops_started` keeps a day, so the one before is recent.
+            elif record.stop_length > 0 and now - record.stop_until < _DAY:
+                # LinkedIn pushing back again within a day of the end of the
+                # last stop: twice as long as that one.
                 length = min(max(base, 2 * record.stop_length), doubled)
             else:
                 length = base
@@ -1127,8 +1140,10 @@ class Pacing:
                 "this_month": record.people_search_pages.get(_month(now), 0),
                 "per_month": settings.search_pages_per_month,
             },
+            # A stop included: an agent checking before a long run is told
+            # when the next visit goes ahead, not that it could now.
             "next_visit_in_seconds": round(
-                max(self._pause_left(now), block[0] if block else 0.0), 1
+                max(stop_left, self._pause_left(now), block[0] if block else 0.0), 1
             ),
             "stop": (
                 {

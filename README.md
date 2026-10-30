@@ -739,9 +739,9 @@ With a paid provider, use a sticky residential session that holds one address (n
 Everything the server asks of LinkedIn draws on one budget for the whole account, whichever tool asks and whichever MCP client it came from:
 
 - A random 3-6 second pause before each page visit.
-- At most 60 page visits in any hour and 300 in any 24 hours. Opening a conversation counts as a visit, and every five scrolls or "Show more" clicks that load more (a profile's lazy sections, a list, the job results rail) count as one; the scroll that finds the page complete is free. A section the limit stopped loading partway is returned with a `rate_limit` section error beside it, so a shorter list never reads as complete.
+- At most 60 page visits in any hour and 300 in any 24 hours. Opening a conversation counts as a visit, with half the page pause between opens (1.5-3 seconds by default), and every five scrolls or "Show more" clicks that load more (a profile's lazy sections, a list, the job results rail) count as one; the scroll that finds the page complete is free. A section the limit stopped loading partway is returned with a `rate_limit` section error beside it, so a shorter list never reads as complete.
 - At most 20 invitations a day and 100 a week, and 50 messages a day.
-- When LinkedIn pushes back (HTTP 429 or 999, its rate-limit page, or a page still empty after a retry), every request stops, from tool calls and the CLI alike: as long as LinkedIn asks (up to a day) and at least 15 minutes, twice as long as the previous stop when it comes within a day of it. A checkpoint or CAPTCHA met during a tool call stops tool calls for 24 hours; signing in yourself is never blocked.
+- When LinkedIn pushes back (HTTP 429 or 999, its rate-limit page, or a page still empty after a retry), every request stops, from tool calls and the CLI alike: as long as LinkedIn asks (up to a day) and at least 15 minutes (5 for a page still empty after its retry), twice as long as the previous stop when it comes within a day of its end, up to a day. A checkpoint or CAPTCHA met during a tool call stops tool calls for 24 hours; signing in yourself is never blocked.
 
 A call that would have to wait more than 30 seconds, or longer than it has left, is refused with the `rate_limited` error code and `retry_after` in seconds, and keeps any pages it already read. `get_session_status` shows what is spent and when the next visit is allowed, without opening the browser. LinkedIn publishes none of its limits, so these are cautious guesses, and every one is a setting.
 
@@ -758,7 +758,7 @@ Lists LinkedIn loads by scrolling, such as the feed, post search and the inbox, 
 
 All optional; `0` turns a limit off. See [`.env.example`](.env.example) for the full descriptions.
 
-- `RATE_LIMIT_PAUSE_SECONDS` - pause before each page visit, one number or a range (default `3-6`)
+- `RATE_LIMIT_PAUSE_SECONDS` - pause before each page visit, one number or a range (default `3-6`); conversations opened in a row wait half of it, at least 1.5-3 seconds
 - `RATE_LIMIT_VISITS_PER_HOUR` / `RATE_LIMIT_VISITS_PER_DAY` (defaults `60` / `300`)
 - `RATE_LIMIT_INVITES_PER_DAY` / `RATE_LIMIT_INVITES_PER_WEEK` (defaults `20` / `100`)
 - `RATE_LIMIT_MESSAGES_PER_DAY` (default `50`)

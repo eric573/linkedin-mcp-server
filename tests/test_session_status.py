@@ -694,6 +694,10 @@ class TestRateLimitBlock:
         assert block["invitations"]["last_24_hours"] == 1
         assert block["stop"]["reason"] == "http_429"
         assert 0 < block["stop"]["seconds_left"] <= 900
+        # Not "now": an agent checking before a long run is told the stop.
+        assert block["next_visit_in_seconds"] == pytest.approx(
+            block["stop"]["seconds_left"], abs=1
+        )
 
     async def test_a_damaged_record_is_reported_and_left_for_the_lease_holder(
         self, server, nothing_may_start, record_path

@@ -31,9 +31,9 @@ because LinkedIn judges what the account does, not which tool asked.
   999 from its hosts at any time, its rate-limit page, a page still empty after
   its retry, a checkpoint or restriction met during a tool call. The longer of
   LinkedIn's `Retry-After` (up to a day) and the server's own wait wins, and
-  each stop that starts within a day of the one before lasts twice as long as
-  that one, so pushback that keeps coming backs off further however it is
-  spaced. The browser closes for it, because the page left open keeps talking
+  each stop that starts within a day of the end of the one before lasts twice
+  as long as that one, up to a day, so pushback that keeps coming backs off
+  further however it is spaced. The browser closes for it, because the page left open keeps talking
   to LinkedIn.
 - A short wait is waited out and a long one refuses with `rate_limited` and
   `retry_after`, keeping whatever pages were read, and a stop refuses
