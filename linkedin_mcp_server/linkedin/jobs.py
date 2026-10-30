@@ -10,7 +10,7 @@ import time
 
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core import pacing
-from linkedin_mcp_server.core.exceptions import LinkedInOperationError
+from linkedin_mcp_server.core.exceptions import LinkedInOperationError, RateLimitError
 from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
 from linkedin_mcp_server.linkedin.capture import (
@@ -72,6 +72,18 @@ def _on_tracker_tab(url: str, stage: JobsTrackerStage) -> bool:
         and parsed.path.rstrip("/") in SAVED_JOBS_PATHS
         and landed_stage == stage
     )
+
+
+def _out_of_time(refused: RateLimitError) -> bool:
+    """Whether *refused* is the gate finding no time left for a wait."""
+    return isinstance(refused, PacingRefusedError) and refused.kind == "time"
+
+
+def _retry_after(refused: RateLimitError) -> int | None:
+    """When what *refused* refused can be had: the gate says, or its stop."""
+    if isinstance(refused, PacingRefusedError):
+        return refused.retry_after
+    return pacing.stop_retry_after()
 
 
 class JobReader:
@@ -354,7 +366,9 @@ class JobReader:
                 # filters or offset can render empty too. Calling that "no jobs"
                 # is a successful answer to a different search.
                 if extracted.text == RATE_LIMITED_SECTION_TEXT:
-                    section_errors["search_results"] = rate_limited_section_error()
+                    section_errors["search_results"] = rate_limited_section_error(
+                        retry_after=pacing.stop_retry_after()
+                    )
                     stop_reason = "rate_limited"
                     break
                 if not extracted.text and extracted.error:
@@ -568,18 +582,19 @@ class JobReader:
                 if page_refs:
                     page_references.extend(page_refs)
 
-            except PacingRefusedError as refused:
-                # The rate limit refused the next page. The pages read so far
-                # stand, and `pagination` says where to resume and why.
+            except RateLimitError as refused:
+                # The rate limit refused the next page, or LinkedIn answered it
+                # with its rate-limit page. The pages read so far stand, and
+                # `pagination` says where to resume and why.
                 if not page_texts:
                     raise
                 # No time left for the gate's wait is the search's own time
                 # budget running out, not LinkedIn or a limit.
-                if refused.kind == "time":
+                if _out_of_time(refused):
                     stop_reason = "time_budget"
                     break
                 section_errors["search_results"] = rate_limited_section_error(
-                    str(refused), retry_after=refused.retry_after
+                    str(refused), retry_after=_retry_after(refused)
                 )
                 stop_reason = "rate_limited"
                 break
@@ -595,7 +610,15 @@ class JobReader:
                 )
                 break
         else:
-            stop_reason = "max_pages"
+            # The last page LinkedIn advertises was read: a cursor would only
+            # buy a navigation past it.
+            if (
+                total_pages is not None
+                and offset >= total_pages * RESULTS_PER_LINKEDIN_PAGE
+            ):
+                stop_reason = "complete"
+            else:
+                stop_reason = "max_pages"
 
         result: dict[str, Any] = {
             "url": base_url,
@@ -725,7 +748,9 @@ class JobReader:
                 # the extraction error, which names what actually failed and
                 # would be masked by the route guard below.
                 if extracted.text == RATE_LIMITED_SECTION_TEXT:
-                    section_errors["saved_jobs"] = rate_limited_section_error()
+                    section_errors["saved_jobs"] = rate_limited_section_error(
+                        retry_after=pacing.stop_retry_after()
+                    )
                     stop_reason = "rate_limited"
                     break
                 if extracted.error:
@@ -850,17 +875,17 @@ class JobReader:
                     stop_reason = "rate_limited"
                     break
 
-            except PacingRefusedError as refused:
+            except RateLimitError as refused:
                 # As in the search: keep the pages read, say when the rest
                 # can be had, and answer with the refusal only when nothing
                 # was read.
                 if not page_texts:
                     raise
-                if refused.kind == "time":
+                if _out_of_time(refused):
                     stop_reason = "time_budget"
                     break
                 section_errors["saved_jobs"] = rate_limited_section_error(
-                    str(refused), retry_after=refused.retry_after
+                    str(refused), retry_after=_retry_after(refused)
                 )
                 stop_reason = "rate_limited"
                 break

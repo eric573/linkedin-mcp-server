@@ -31,6 +31,8 @@ from linkedin_mcp_server.linkedin.search_urls import (
     make_cursor,
     next_cursor,
     read_cursor,
+    results_digest,
+    search_fingerprint,
 )
 
 JOBS = "https://www.linkedin.com/jobs/search/?"
@@ -650,16 +652,17 @@ class TestCursors:
 
     def test_a_cursor_reads_back_as_its_position(self):
         cursor = make_cursor(4, self.PEOPLE_SEARCH)
-        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == 4
+        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1).position == 4
 
     def test_the_page_a_url_is_on_does_not_change_the_search(self):
         # The walk builds the cursor from page one's address and the tool
         # checks it against the same, but neither may depend on that.
         later = build_people_search_url("engineer", network=["F"], page=7)
         cursor = make_cursor(8, later)
-        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == 8
+        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1).position == 8
         jobs = build_job_search_url("python")
-        assert read_cursor(make_cursor(50, f"{jobs}&start=25"), jobs, first=0) == 50
+        resumed = read_cursor(make_cursor(50, f"{jobs}&start=25"), jobs, first=0)
+        assert resumed.position == 50
 
     @pytest.mark.parametrize(
         "other",
@@ -678,12 +681,49 @@ class TestCursors:
         with pytest.raises(InvalidReferenceError, match="different search"):
             read_cursor(cursor, self.PEOPLE_SEARCH, first=1)
 
+    @pytest.mark.parametrize(
+        ("one", "other"),
+        [
+            (build_people_search_url("engineer"), build_company_search_url("engineer")),
+            (
+                build_job_search_url("python"),
+                "https://www.linkedin.com/jobs-tracker/?keywords=python",
+            ),
+        ],
+        ids=["people-vs-companies", "jobs-vs-tracker"],
+    )
+    def test_the_same_query_on_another_route_is_another_search(self, one, other):
+        cursor = make_cursor(2, one)
+        with pytest.raises(InvalidReferenceError, match="different search"):
+            read_cursor(cursor, other, first=1)
+
     @pytest.mark.parametrize("cursor", [None, "", "   "])
     def test_no_cursor_starts_at_the_first_position(self, cursor):
-        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == 1
-        assert read_cursor(cursor, build_job_search_url("python"), first=0) == 0
+        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == (1, None)
+        assert read_cursor(cursor, build_job_search_url("python"), first=0) == (0, None)
 
-    @pytest.mark.parametrize("cursor", ["2", "two.abcd1234", "-1.abcd1234", "2.", ".x"])
+    def test_a_cursor_carries_the_last_pages_results(self):
+        digest = results_digest(["/in/bob/", "/in/ada/"])
+        cursor = make_cursor(4, self.PEOPLE_SEARCH, digest)
+        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == (4, digest)
+        # In whatever order the page showed them.
+        assert results_digest(["/in/ada/", "/in/bob/", "/in/ada/"]) == digest
+        assert results_digest(["/in/ada/"]) != digest
+
+    @pytest.mark.parametrize(
+        "cursor",
+        [
+            "2",
+            "two.abcd1234",
+            "-1.abcd1234",
+            "2.",
+            ".x",
+            "²." + search_fingerprint(PEOPLE_SEARCH),
+            "٣." + search_fingerprint(PEOPLE_SEARCH),
+            "2." + search_fingerprint(PEOPLE_SEARCH) + ".nothex!!",
+            "2." + search_fingerprint(PEOPLE_SEARCH) + ".abcd1234.extra",
+        ],
+    )
     def test_a_malformed_cursor_is_refused(self, cursor: str):
         with pytest.raises(InvalidReferenceError, match="not one this server gave out"):
             read_cursor(cursor, self.PEOPLE_SEARCH, first=1)
@@ -697,7 +737,7 @@ class TestCursors:
     def test_a_stop_that_leaves_results_comes_with_a_cursor(self, reason: str):
         cursor = next_cursor(reason, 3, self.PEOPLE_SEARCH)
         assert cursor is not None
-        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1) == 3
+        assert read_cursor(cursor, self.PEOPLE_SEARCH, first=1).position == 3
 
     @pytest.mark.parametrize(
         "reason", ["complete", "no_new_results", "no_new_ids", "anything else"]

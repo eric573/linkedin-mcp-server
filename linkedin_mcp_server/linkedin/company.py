@@ -210,9 +210,12 @@ class CompanyReader:
         *,
         max_pages: int = 1,
         first_page: int = 1,
+        last_results: str | None = None,
         tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         """Search for companies and read result pages, ten companies each.
+
+        *first_page* and *last_results* come from a cursor.
 
         Returns:
             {url, sections: {search_results}, references?, section_errors?,
@@ -224,5 +227,7 @@ class CompanyReader:
             result_kind="company",
             first_page=first_page,
             max_pages=max_pages,
+            previous=last_results,
+            landed_url=lambda: self._session.page.url,
             tool_timeout=tool_timeout,
         )

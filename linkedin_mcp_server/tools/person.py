@@ -202,13 +202,19 @@ def register_person_tools(
             timeout was near) or rate_limited (the account's rate limit or
             LinkedIn stopped it; section_errors says when to retry). Only the
             last three come with a next_cursor, and more results may exist.
+            Members LinkedIn shows without a profile link ("LinkedIn Member")
+            have no URL to return, but their page is read and passed.
             pagination is absent when a failure stopped the search, which
-            section_errors then explains.
+            section_errors then explains, for example dropped_page when
+            LinkedIn answered a result page with a different one.
         """
         # Before the browser, as in search_jobs: the extractor's time budget
         # is what is left of the figure FastMCP cancels this call on.
         started = time.monotonic()
         terms = keywords or ""
+        # Blank is no filter, as the URL builder reads it, so it does not
+        # count as one here either.
+        connection_of = (connection_of or "").strip() or None
         if not terms.strip() and not (
             location or network or current_company or connection_of
         ):
@@ -233,7 +239,7 @@ def register_person_tools(
             raise CodedToolError(str(e), ErrorCode.INVALID_ARGUMENT) from e
         # A cursor from another search would page through results nobody asked
         # for, so it is refused here, before a page is spent on it.
-        first_page = read_cursor(cursor, search_url, first=1)
+        resume = read_cursor(cursor, search_url, first=1)
 
         extractor = await get_ready_extractor(ctx, tool_name="search_people")
         logger.info(
@@ -244,8 +250,8 @@ def register_person_tools(
             network,
             current_company,
             connection_of,
-            first_page,
-            first_page + max_pages - 1,
+            resume.position,
+            resume.position + max_pages - 1,
         )
 
         await ctx.report_progress(
@@ -260,7 +266,8 @@ def register_person_tools(
                 current_company=current_company,
                 connection_of=connection_of,
                 max_pages=max_pages,
-                first_page=first_page,
+                first_page=resume.position,
+                last_results=resume.last_results,
                 # What is left of the figure FastMCP cancels this call on.
                 tool_timeout=max(0.0, tool_timeout - (time.monotonic() - started)),
             )

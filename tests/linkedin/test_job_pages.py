@@ -1234,6 +1234,39 @@ class TestExtractSearchPage:
             RATE_LIMITED_SECTION_TEXT if attempts == 1 else "Python Developer"
         )
 
+    async def test_an_empty_page_not_retried_for_lack_of_time_stops_requests(
+        self, mock_page
+    ):
+        """The search resumes at this page, and without a stop that would be at once."""
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+
+        gate = pacing.Pacing(RateLimitConfig(), None)
+        pacing.install_gate(gate)
+
+        class Clock:
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+        once = AsyncMock(
+            return_value=ExtractedSection(text=RATE_LIMITED_SECTION_TEXT, references=[])
+        )
+        reader = _reader(mock_page)
+        with (
+            patch.object(job_pages_module, "time", Clock()),
+            patch.object(reader, "_extract_search_page_once", once),
+        ):
+            await reader._extract_search_page(
+                "https://www.linkedin.com/jobs/search/?keywords=test",
+                section_name="search_results",
+                page_deadline=5.0,
+            )
+
+        assert once.await_count == 1
+        assert gate.stop_active()
+
     async def test_the_search_page_keeps_every_reference_it_found(self, mock_page):
         """No per-page cap here: the workflow reconciles against the rail.
 

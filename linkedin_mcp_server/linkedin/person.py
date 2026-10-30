@@ -510,6 +510,7 @@ class PersonReader:
         *,
         max_pages: int = 1,
         first_page: int = 1,
+        last_results: str | None = None,
         tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         """Search for people and read result pages, ten people each.
@@ -540,6 +541,7 @@ class PersonReader:
                 connections, and only when they have not hidden the list.
             max_pages: Result pages to read in this call.
             first_page: The result page to start from, from a cursor.
+            last_results: The cursor's digest of the page before it.
             tool_timeout: What is left of the tool's timeout.
 
         Returns:
@@ -572,5 +574,7 @@ class PersonReader:
             result_kind="person",
             first_page=first_page,
             max_pages=max_pages,
+            previous=last_results,
+            landed_url=lambda: self._session.page.url,
             tool_timeout=tool_timeout,
         )

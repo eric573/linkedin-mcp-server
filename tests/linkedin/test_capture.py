@@ -186,6 +186,75 @@ class TestExtractPage:
         # goto called twice (initial + retry)
         assert mock_page.goto.await_count == 2
 
+    @pytest.mark.parametrize("first_attempt", [12.0, 0.0], ids=["slow", "fast"])
+    async def test_an_empty_page_is_retried_only_with_time_for_it(
+        self, mock_page, monkeypatch, first_attempt
+    ):
+        """A retry the deadline cannot hold is not started, and the empty answer
+        is taken as throttling: the caller resumes at this page, and without a
+        stop that would be at once.
+
+        The capture has 20s. After a first attempt of 12s, the 5s backoff and
+        a page do not fit in what is left; after an instant one they do.
+        """
+        import time
+        from types import SimpleNamespace
+
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+        from linkedin_mcp_server.linkedin import capture as capture_module
+
+        started = time.monotonic()
+        monkeypatch.setattr(
+            capture_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: started + first_attempt),
+        )
+
+        gate = pacing.Pacing(
+            RateLimitConfig(pause_min_seconds=0, pause_max_seconds=0), None
+        )
+        pacing.install_gate(gate)
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": "About\nAccessibility",
+                "references": [],
+            }
+        )
+        capture = _capture(mock_page)
+        with (
+            patch(
+                "linkedin_mcp_server.linkedin.session.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            pacing.tool_call(deadline=None),
+        ):
+            result = await capture.capture(
+                "https://www.linkedin.com/search/results/people/?keywords=x",
+                section_name="search_results",
+                plan=CapturePlan(CaptureMode.SEARCH_RESULTS),
+                deadline=started + 20.0,
+            )
+
+        assert result.text == RATE_LIMITED_SECTION_TEXT
+        assert mock_page.goto.await_count == (1 if first_attempt else 2)
+        # Either way the page came back empty, and requests stop.
+        assert gate.stop_active()
+
     async def test_retry_succeeds_after_rate_limit(self, mock_page):
         """When first attempt is rate-limited but retry succeeds, return content."""
         noise_only = "More profiles for you\n\nAbout\nAccessibility\nTalent Solutions"

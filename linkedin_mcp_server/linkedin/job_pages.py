@@ -28,7 +28,10 @@ from linkedin_mcp_server.core.utils import (
     scroll_to_bottom,
 )
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
-from linkedin_mcp_server.linkedin.capture import RATE_LIMIT_RETRY_DELAY
+from linkedin_mcp_server.linkedin.capture import (
+    RATE_LIMIT_RETRY_DELAY,
+    RETRY_PAGE_ALLOWANCE,
+)
 from linkedin_mcp_server.linkedin.content import PageContentReader
 from linkedin_mcp_server.linkedin.contracts import (
     RATE_LIMITED_SECTION_TEXT,
@@ -52,14 +55,6 @@ from linkedin_mcp_server.linkedin.text import (
 )
 
 logger = logging.getLogger(__name__)
-
-# What the rate-limit retry has to have left after its backoff before it is
-# worth starting. The retry is a whole page again, and a search page measured
-# 6.5s on average (ten navigations of a Paris developer search, 83s). One
-# admitted with less times out in navigation, which trades the rate-limit
-# answer the first attempt already had for a timeout that explains nothing.
-_RETRY_PAGE_ALLOWANCE = 6.5
-
 
 # The id is the trailing run of digits, and LinkedIn serves the same job under
 # both `/jobs/view/1967281839/` and `/jobs/view/<title>-at-<company>-1967281839/`.
@@ -509,12 +504,16 @@ class JobPageReader:
 
             if page_deadline is not None:
                 left = page_deadline - time.monotonic()
-                if left < RATE_LIMIT_RETRY_DELAY + _RETRY_PAGE_ALLOWANCE:
+                if left < RATE_LIMIT_RETRY_DELAY + RETRY_PAGE_ALLOWANCE:
                     logger.info(
                         "Not retrying search page %s: %.1fs of the budget left",
                         url,
                         left,
                     )
+                    # The empty answer is all there is, and taken as the
+                    # throttling it usually is: the search resumes here, and
+                    # without a stop that would be at once.
+                    pacing.note_empty_page()
                     return self._captured(result, charge.seconds)
 
             logger.info(

@@ -747,7 +747,7 @@ A call that would have to wait more than 30 seconds, or longer than it has left,
 
 ### Paging
 
-`search_people` and `search_companies` read one page of ten results unless `max_pages` asks for more, up to 10 in one call; `search_jobs` and `get_saved_jobs` read three by default. Each page is a page visit against the budget above. When results were left unread, because `max_pages` was reached, the tool's time ran short, or the rate limit stopped the call, the result's `pagination.next_cursor` continues the search: pass it back as `cursor` with the same keywords and filters. A cursor from a different search is refused before anything is loaded, and a search that ran out of results returns none, so a loop that pages while a cursor comes back ends on its own.
+`search_people` and `search_companies` read one page of ten results unless `max_pages` asks for more, up to 10 in one call; `search_jobs` and `get_saved_jobs` read three by default. Each page is a page visit against the budget above. When results were left unread, because `max_pages` was reached, the tool's time ran short, or the rate limit stopped the call, the result's `pagination.next_cursor` continues the search: pass it back as `cursor` with the same keywords and filters. A cursor from a different search is refused before anything is loaded, and a search that ran out of results returns none, so a loop that pages while a cursor comes back ends on its own, also when LinkedIn serves its last page again past the end. Members LinkedIn shows only as "LinkedIn Member" have no profile link to return, but their page is read and paging goes on past it.
 
 Lists LinkedIn loads by scrolling, such as the feed, post search and the inbox, cannot be resumed this way: ask for what you need in one call.
 

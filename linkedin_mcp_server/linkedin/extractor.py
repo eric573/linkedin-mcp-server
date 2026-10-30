@@ -211,6 +211,7 @@ class LinkedInExtractor:
         *,
         max_pages: int = 1,
         first_page: int = 1,
+        last_results: str | None = None,
         tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         """Search for people and extract the result pages."""
@@ -222,6 +223,7 @@ class LinkedInExtractor:
             connection_of=connection_of,
             max_pages=max_pages,
             first_page=first_page,
+            last_results=last_results,
             tool_timeout=tool_timeout,
         )
 
@@ -231,6 +233,7 @@ class LinkedInExtractor:
         *,
         max_pages: int = 1,
         first_page: int = 1,
+        last_results: str | None = None,
         tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         """Search for companies and extract the result pages."""
@@ -238,6 +241,7 @@ class LinkedInExtractor:
             keywords,
             max_pages=max_pages,
             first_page=first_page,
+            last_results=last_results,
             tool_timeout=tool_timeout,
         )
 

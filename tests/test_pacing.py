@@ -364,6 +364,21 @@ class TestDeadline:
         assert refused.value.retry_after == 5
         assert clock.slept == []
 
+    async def test_a_page_too_close_to_the_end_is_refused_with_no_pause_left(
+        self, clock, record_path
+    ):
+        """It would be cancelled with the call, and everything read before it."""
+        gate = make_gate(clock, record_path)
+        with pacing.tool_call(deadline=clock.mono + 600):
+            await visit(gate)
+        clock.advance(10)
+        with pacing.tool_call(deadline=clock.mono + 10):
+            with pytest.raises(PacingRefusedError, match="no time left for") as refused:
+                await gate.before_visit(_PROFILE)
+        assert refused.value.kind == "time"
+        with pacing.tool_call(deadline=clock.mono + 20):
+            await gate.before_visit(_PROFILE)
+
     async def test_the_navigation_deadline_counts_as_well_as_the_calls(
         self, clock, record_path
     ):

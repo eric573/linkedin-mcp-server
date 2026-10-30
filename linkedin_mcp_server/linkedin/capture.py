@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 import logging
 
 import asyncio
+import time
 from typing import Any
 
 import anyio
@@ -55,6 +56,13 @@ logger = logging.getLogger(__name__)
 # constants would let one relocation give the two retry paths different policies
 # without anything failing.
 RATE_LIMIT_RETRY_DELAY = 5.0
+
+# What the rate-limit retry has to have left after its backoff before it is
+# worth starting. The retry is a whole page again, and a search page measured
+# 6.5s on average (ten navigations of a Paris developer search, 83s). One
+# admitted with less times out in navigation, which trades the rate-limit
+# answer the first attempt already had for a timeout that explains nothing.
+RETRY_PAGE_ALLOWANCE = 6.5
 
 
 class OverlayRootNotFoundError(RuntimeError):
@@ -247,8 +255,15 @@ class SectionCapture:
         url: str,
         section_name: str,
         plan: CapturePlan,
+        *,
+        deadline: float | None = None,
     ) -> ExtractedSection:
-        """Navigate and capture a section according to an explicit plan."""
+        """Navigate and capture a section according to an explicit plan.
+
+        *deadline* is a monotonic reading the capture has to finish by: its
+        navigations are refused past it, and the retry of an empty page is not
+        started when its backoff and a page will not fit before it.
+        """
         # Installed before any navigation and removed after every attempt: the
         # initial document response is part of what the listener must catch,
         # and the retry would otherwise leak the first registration.
@@ -258,8 +273,23 @@ class SectionCapture:
             listener.install()
         try:
             try:
-                result = await self._capture_once(url, section_name, plan, listener)
+                result = await self._capture_once(
+                    url, section_name, plan, listener, deadline=deadline
+                )
                 if result.text != RATE_LIMITED_SECTION_TEXT:
+                    return result
+
+                if (
+                    deadline is not None
+                    and time.monotonic() + RATE_LIMIT_RETRY_DELAY + RETRY_PAGE_ALLOWANCE
+                    > deadline
+                ):
+                    # Not retried for lack of time. The empty answer is then
+                    # all there is, and taken as the throttling it usually is:
+                    # the caller resumes here, and without a stop that would
+                    # be at once.
+                    logger.info("Not retrying %s: no time left for it", url)
+                    pacing.note_empty_page()
                     return result
 
                 if CaptureMode.OVERLAY in plan.mode:
@@ -284,7 +314,9 @@ class SectionCapture:
                 await self._session.delay(RATE_LIMIT_RETRY_DELAY)
                 if listener is not None:
                     listener.install()
-                result = await self._capture_once(url, section_name, plan, listener)
+                result = await self._capture_once(
+                    url, section_name, plan, listener, deadline=deadline
+                )
                 if result.text == RATE_LIMITED_SECTION_TEXT:
                     # Empty again after the backoff: the usual sign of
                     # throttling, so every request stops for a while.
@@ -339,9 +371,14 @@ class SectionCapture:
         section_name: str,
         plan: CapturePlan,
         permalink_capture: _PermalinkResponseListener | None = None,
+        *,
+        deadline: float | None = None,
     ) -> ExtractedSection:
         """Single attempt to navigate and capture a section."""
-        await self._navigator._navigate_to_page(url)
+        if deadline is None:
+            await self._navigator._navigate_to_page(url)
+        else:
+            await self._navigator._navigate_to_page(url, deadline=deadline)
         if CaptureMode.OVERLAY in plan.mode:
             return await self._extract_overlay_content(url, section_name)
         return await self._extract_loaded_section(

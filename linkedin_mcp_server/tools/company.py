@@ -190,13 +190,13 @@ def register_company_tools(
         started = time.monotonic()
         # Refused before the browser: a cursor from another search would page
         # through results nobody asked for.
-        first_page = read_cursor(cursor, build_company_search_url(keywords), first=1)
+        resume = read_cursor(cursor, build_company_search_url(keywords), first=1)
         extractor = await get_ready_extractor(ctx, tool_name="search_companies")
         logger.info(
             "Searching companies: keywords='%s', pages %d-%d",
             keywords,
-            first_page,
-            first_page + max_pages - 1,
+            resume.position,
+            resume.position + max_pages - 1,
         )
 
         await ctx.report_progress(
@@ -206,7 +206,8 @@ def register_company_tools(
         result = await extractor.search_companies(
             keywords,
             max_pages=max_pages,
-            first_page=first_page,
+            first_page=resume.position,
+            last_results=resume.last_results,
             # What is left of the figure FastMCP cancels this call on.
             tool_timeout=max(0.0, tool_timeout - (time.monotonic() - started)),
         )

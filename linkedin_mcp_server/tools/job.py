@@ -199,7 +199,7 @@ def register_job_tools(
                 sort_by=sort_by,
             ),
             first=0,
-        )
+        ).position
         extractor = await get_ready_extractor(ctx, tool_name="search_jobs")
         logger.info(
             "Searching jobs: keywords='%s', location='%s', max_pages=%d",
@@ -266,7 +266,7 @@ def register_job_tools(
         """
         # Refused before the browser: a cursor from another stage would read
         # pages of a list nobody asked for.
-        first_page = read_cursor(cursor, saved_jobs_list_url(stage), first=0)
+        first_page = read_cursor(cursor, saved_jobs_list_url(stage), first=0).position
         extractor = await get_ready_extractor(ctx, tool_name="get_saved_jobs")
         logger.info(
             "Fetching %s jobs (max_pages=%d, from page %d)",

@@ -697,14 +697,24 @@ class TestEmployeesCutShort:
         assert "section_errors" not in result
 
 
+def _landing(mock_page, *answers):
+    """A capture that lands on the address it was asked for, as a page does."""
+    supply = iter(answers)
+
+    async def capture(url, *args, **kwargs):
+        mock_page.url = url
+        return next(supply)
+
+    return capture
+
+
 class TestSearchCompanies:
     async def test_the_results_page_is_returned_under_the_search_url(self, mock_page):
         reader = _reader(mock_page)
         with patch.object(
             reader._capture,
             "capture",
-            new_callable=AsyncMock,
-            return_value=extracted("Fintech Inc"),
+            side_effect=_landing(mock_page, extracted("Fintech Inc")),
         ) as mock_extract:
             result = await reader.search_companies("fintech")
 
@@ -729,11 +739,11 @@ class TestSearchCompanies:
         with patch.object(
             reader._capture,
             "capture",
-            new_callable=AsyncMock,
-            side_effect=[
+            side_effect=_landing(
+                mock_page,
                 extracted("Acme", [{"kind": "company", "url": "/company/acme/"}]),
                 extracted("Beta", [{"kind": "company", "url": "/company/beta/"}]),
-            ],
+            ),
         ) as mock_extract:
             result = await reader.search_companies("fintech", first_page=3, max_pages=2)
 
@@ -744,13 +754,27 @@ class TestSearchCompanies:
         assert result["sections"] == {"search_results": "Acme\n---\nBeta"}
         assert result["pagination"]["reason"] == "max_pages"
 
+    async def test_a_page_that_lands_on_another_is_not_taken_for_it(self, mock_page):
+        reader = _reader(mock_page)
+        first = "https://www.linkedin.com/search/results/companies/?keywords=fintech"
+
+        async def land_on_page_one(url, *args, **kwargs):
+            mock_page.url = first
+            return extracted("Acme", [{"kind": "company", "url": "/company/acme/"}])
+
+        with patch.object(reader._capture, "capture", side_effect=land_on_page_one):
+            result = await reader.search_companies("fintech", first_page=2)
+
+        assert result["section_errors"]["search_results"]["error_type"] == (
+            "dropped_page"
+        )
+
     async def test_an_empty_result_omits_the_optional_keys(self, mock_page):
         reader = _reader(mock_page)
         with patch.object(
             reader._capture,
             "capture",
-            new_callable=AsyncMock,
-            return_value=extracted(""),
+            side_effect=_landing(mock_page, extracted("")),
         ):
             result = await reader.search_companies("nothing matches this")
 

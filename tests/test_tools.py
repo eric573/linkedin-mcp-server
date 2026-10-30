@@ -128,6 +128,24 @@ def serve_extractor(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], AsyncMoc
         (
             "person",
             "search_people",
+            {"connection_of": "   "},
+            "Give keywords, a filter",
+        ),
+        (
+            "person",
+            "search_people",
+            {"keywords": " ", "connection_of": " ", "max_pages": 10},
+            "Give keywords, a filter",
+        ),
+        (
+            "person",
+            "search_people",
+            {"keywords": "engineer", "cursor": "².00000000"},
+            "not one this server gave out",
+        ),
+        (
+            "person",
+            "search_people",
             {"keywords": "engineer", "cursor": "two"},
             "not one this server gave out",
         ),
@@ -834,6 +852,7 @@ class TestPersonTool:
             connection_of=None,
             max_pages=1,
             first_page=1,
+            last_results=None,
             tool_timeout=ANY,
         )
 
@@ -874,6 +893,7 @@ class TestPersonTool:
             connection_of=None,
             max_pages=1,
             first_page=1,
+            last_results=None,
             tool_timeout=ANY,
         )
 
@@ -940,6 +960,7 @@ class TestPersonTool:
             connection_of=None,
             max_pages=1,
             first_page=1,
+            last_results=None,
             tool_timeout=ANY,
         )
 
@@ -2574,7 +2595,7 @@ class TestSearchCompaniesTool:
         result = await tool_fn("fintech", mock_context)
         assert "search_results" in result["sections"]
         mock_extractor.search_companies.assert_awaited_once_with(
-            "fintech", max_pages=1, first_page=1, tool_timeout=ANY
+            "fintech", max_pages=1, first_page=1, last_results=None, tool_timeout=ANY
         )
 
     async def test_search_companies_error(self, mock_context, serve_extractor):

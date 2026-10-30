@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import NamedTuple
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit
 
 import hashlib
@@ -253,8 +255,29 @@ def _page_parameter(page: int) -> str:
 # the caller never asked for, so the fingerprint refuses it. The position is a
 # result page for people and company search, an offset for job search and a
 # page index for the saved-jobs tracker; the search it belongs to decides.
+#
+# A people or company cursor also carries a digest of the last page's results,
+# "3.1f2e3d4c.9a8b7c6d", so the call that resumes it can tell LinkedIn serving
+# that page again from a page of its own. Without it, every call starts with
+# nothing to compare its first page with, and a caller paging one page at a
+# time would loop on a repeated page for as long as LinkedIn serves it.
 
 _PAGING_PARAMETERS = frozenset({"page", "start"})
+_POSITION = re.compile(r"[0-9]+")
+_DIGEST = re.compile(r"[0-9a-f]{8}")
+
+#: The last result page a people or company search is read to. A backstop
+#: rather than a measurement of LinkedIn: a cursor loop ends here whatever
+#: LinkedIn serves past it.
+LAST_RESULT_PAGE = 100
+
+
+class ResumePoint(NamedTuple):
+    """Where a cursor resumes its search, and what the page before it held."""
+
+    position: int
+    #: Digest of the results on the page read last, see `results_digest`.
+    last_results: str | None = None
 
 
 def search_fingerprint(url: str) -> str:
@@ -269,9 +292,16 @@ def search_fingerprint(url: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
 
 
-def make_cursor(position: int, search_url: str) -> str:
+def results_digest(result_urls: Iterable[str]) -> str:
+    """Eight hex digits naming a page's results, in whatever order it shows them."""
+    joined = "\n".join(sorted(set(result_urls)))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:8]
+
+
+def make_cursor(position: int, search_url: str, last_results: str | None = None) -> str:
     """The cursor that resumes the search at *search_url* from *position*."""
-    return f"{position}.{search_fingerprint(search_url)}"
+    cursor = f"{position}.{search_fingerprint(search_url)}"
+    return cursor if last_results is None else f"{cursor}.{last_results}"
 
 
 # Why a paged read stopped, when another call can pick up where it did. A read
@@ -279,7 +309,9 @@ def make_cursor(position: int, search_url: str) -> str:
 _RESUMABLE_STOPS = frozenset({"max_pages", "time_budget", "rate_limited"})
 
 
-def next_cursor(reason: str, position: int, search_url: str) -> str | None:
+def next_cursor(
+    reason: str, position: int, search_url: str, last_results: str | None = None
+) -> str | None:
     """The cursor for a read that stopped for *reason* before *position*.
 
     None when the stop leaves nothing to read, so a cursor in a result always
@@ -287,10 +319,10 @@ def next_cursor(reason: str, position: int, search_url: str) -> str | None:
     """
     if reason not in _RESUMABLE_STOPS:
         return None
-    return make_cursor(position, search_url)
+    return make_cursor(position, search_url, last_results)
 
 
-def read_cursor(cursor: str | None, search_url: str, *, first: int) -> int:
+def read_cursor(cursor: str | None, search_url: str, *, first: int) -> ResumePoint:
     """Where *cursor* resumes the search at *search_url*; *first* without one.
 
     Raises:
@@ -298,26 +330,32 @@ def read_cursor(cursor: str | None, search_url: str, *, first: int) -> int:
             different search.
     """
     if cursor is None or not cursor.strip():
-        return first
-    position_text, separator, fingerprint = cursor.strip().partition(".")
-    if not separator or not position_text.isdigit() or not fingerprint:
+        return ResumePoint(first)
+    parts = cursor.strip().split(".")
+    # ASCII digits only: `str.isdigit` also passes "²", which `int` refuses.
+    if (
+        len(parts) not in (2, 3)
+        or not _POSITION.fullmatch(parts[0])
+        or not parts[1]
+        or (len(parts) == 3 and not _DIGEST.fullmatch(parts[2]))
+    ):
         raise InvalidReferenceError(
             f"cursor {cursor!r} is not one this server gave out. Pass the "
             "pagination.next_cursor of the previous result exactly, or leave "
             "cursor out to start from the beginning."
         )
-    if fingerprint != search_fingerprint(search_url):
+    if parts[1] != search_fingerprint(search_url):
         raise InvalidReferenceError(
             "cursor belongs to a different search. Repeat the search it came "
             "from with the same keywords and filters, or leave cursor out to "
             "start this one from the beginning."
         )
-    position = int(position_text)
+    position = int(parts[0])
     if position < first:
         raise InvalidReferenceError(
             f"cursor {cursor!r} names a position before the first one."
         )
-    return position
+    return ResumePoint(position, parts[2] if len(parts) == 3 else None)
 
 
 def build_content_search_url(

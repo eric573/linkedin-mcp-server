@@ -1896,15 +1896,18 @@ class TestSearchPeople:
         """Every page keeps the search's filters and adds LinkedIn's page number."""
         member = "ACoAAB1IelEBLEkqTkNbZ-a1D8mq5R-6C1ihSEk"
         reader = _reader(mock_page)
-        with patch.object(
-            reader._capture,
-            "capture",
-            new_callable=AsyncMock,
-            side_effect=[
+        answers = iter(
+            [
                 extracted("Ada", [{"kind": "person", "url": "/in/ada/"}]),
                 extracted("Bob", [{"kind": "person", "url": "/in/bob/"}]),
-            ],
-        ) as capture:
+            ]
+        )
+
+        async def land(url, *args, **kwargs):
+            mock_page.url = url
+            return next(answers)
+
+        with patch.object(reader._capture, "capture", side_effect=land) as capture:
             result = await reader.search_people(
                 "", network=["F", "S"], connection_of=member, max_pages=2
             )
@@ -1915,6 +1918,23 @@ class TestSearchPeople:
         assert all(query["network"] == ['["F","S"]'] for query in queries)
         assert result["sections"] == {"search_results": "Ada\n---\nBob"}
         assert result["pagination"]["reason"] == "max_pages"
+
+    async def test_a_page_that_lands_on_another_is_not_taken_for_it(self, mock_page):
+        """LinkedIn dropping `page` serves page one again under page two's number."""
+        reader = _reader(mock_page)
+        first = "https://www.linkedin.com/search/results/people/?keywords=engineer"
+
+        async def land_on_page_one(url, *args, **kwargs):
+            mock_page.url = first
+            return extracted("Ada", [{"kind": "person", "url": "/in/ada/"}])
+
+        with patch.object(reader._capture, "capture", side_effect=land_on_page_one):
+            result = await reader.search_people("engineer", first_page=2)
+
+        assert result["section_errors"]["search_results"]["error_type"] == (
+            "dropped_page"
+        )
+        assert "pagination" not in result
 
     async def test_a_vanity_name_costs_no_page_load(self, mock_page):
         reader = _reader(mock_page)
@@ -2120,3 +2140,65 @@ class TestARateLimitRefusalMidWalk:
             "second": ["/in/bob/"],
         }
         assert result["section_errors"]["sidebar_profiles"]["retry_after"] == 120
+
+
+class TestACursorRoundTrip:
+    """A cursor the reader hands out is one the tool takes back, and only that."""
+
+    async def test_the_tool_resumes_what_the_reader_handed_out(
+        self, mock_page, monkeypatch
+    ):
+        from fastmcp import FastMCP
+        from fastmcp.exceptions import ToolError
+
+        import linkedin_mcp_server.tools.person as tools_person
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        member = "ACoAAB1IelEBLEkqTkNbZ-a1D8mq5R-6C1ihSEk"
+        filters: dict[str, Any] = {
+            "location": "103644278",
+            "network": ["F", "S"],
+            "current_company": "1115",
+            "connection_of": member,
+        }
+        reader = _reader(mock_page)
+
+        async def land(url, *args, **kwargs):
+            mock_page.url = url
+            return extracted("Ada", [{"kind": "person", "url": "/in/ada/"}])
+
+        with patch.object(reader._capture, "capture", side_effect=land):
+            first = await reader.search_people("engineer", **filters)
+        cursor = first["pagination"]["next_cursor"]
+        assert cursor is not None
+
+        extractor = MagicMock()
+        extractor.search_people = AsyncMock(return_value={"url": "u", "sections": {}})
+
+        async def ready(ctx, tool_name):
+            return extractor
+
+        monkeypatch.setattr(tools_person, "get_ready_extractor", ready)
+        mcp = FastMCP("test")
+        register_person_tools(mcp)
+
+        await mcp.call_tool(
+            "search_people", {"keywords": "engineer", **filters, "cursor": cursor}
+        )
+        call = extractor.search_people.await_args
+        assert call is not None
+        kwargs = call.kwargs
+        assert kwargs["first_page"] == 2
+        assert kwargs["last_results"] == cursor.split(".")[2]
+
+        for name, other in [
+            ("location", "90009496"),
+            ("network", ["F"]),
+            ("current_company", "1035"),
+            ("connection_of", "ACoAAA8BYqEBCGLg_vT_ca6mMEqkpp9nVffJ3hc"),
+        ]:
+            with pytest.raises(ToolError, match="different search"):
+                await mcp.call_tool(
+                    "search_people",
+                    {"keywords": "engineer", **filters, name: other, "cursor": cursor},
+                )

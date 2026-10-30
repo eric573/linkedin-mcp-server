@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -3910,3 +3911,246 @@ class TestSavedJobsCutShort:
             "next_cursor": make_cursor(1, result["url"]),
             "reason": "rate_limited",
         }
+
+
+class TestACursorRoundTrip:
+    """A cursor the search hands out is one the tool takes back, and only that."""
+
+    async def test_the_tool_resumes_what_the_search_handed_out(
+        self, mock_page, monkeypatch
+    ):
+        from unittest.mock import MagicMock
+
+        from fastmcp import FastMCP
+        from fastmcp.exceptions import ToolError
+
+        import linkedin_mcp_server.tools.job as tools_job
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        filters: dict[str, Any] = {
+            "location": "Berlin",
+            "date_posted": "past_week",
+            "job_type": "full_time",
+            "experience_level": "mid_senior",
+            "work_type": "remote",
+            "easy_apply": True,
+            "sort_by": "date",
+        }
+        reader = _reader(mock_page)
+
+        async def read_page(url, *args, **kwargs):
+            navigate(mock_page, url)
+            return captured(mock_page, extracted("Job results"))
+
+        with (
+            patch.object(reader._pages, "_extract_search_page", side_effect=read_page),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["101", "102"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            first = await reader.search_jobs("python", max_pages=1, **filters)
+        cursor = first["pagination"]["next_cursor"]
+        assert cursor is not None
+
+        extractor = MagicMock()
+        extractor.search_jobs = AsyncMock(return_value={"url": "u", "sections": {}})
+
+        async def ready(ctx, tool_name):
+            return extractor
+
+        monkeypatch.setattr(tools_job, "get_ready_extractor", ready)
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        await mcp.call_tool(
+            "search_jobs",
+            {"keywords": "python", **filters, "max_pages": 1, "cursor": cursor},
+        )
+        call = extractor.search_jobs.await_args
+        assert call is not None
+        assert call.kwargs["first_offset"] == 2
+
+        for name, other in [
+            ("location", "Paris"),
+            ("date_posted", "past_month"),
+            ("job_type", "contract"),
+            ("experience_level", "entry"),
+            ("work_type", "hybrid"),
+            ("easy_apply", False),
+            ("sort_by", "relevance"),
+        ]:
+            with pytest.raises(ToolError, match="different search"):
+                await mcp.call_tool(
+                    "search_jobs",
+                    {"keywords": "python", **filters, name: other, "cursor": cursor},
+                )
+
+
+class TestTheEndOfAJobSearch:
+    async def test_the_last_advertised_page_leaves_no_cursor(self, mock_page):
+        """A cursor past it would buy a navigation to a page that is not there."""
+        reader = _reader(mock_page)
+        ids = iter([[str(n) for n in range(25)], [str(n) for n in range(25, 50)]])
+
+        async def read_page(url, *args, **kwargs):
+            navigate(mock_page, url)
+            return captured(mock_page, extracted("Job results"))
+
+        with (
+            patch.object(reader._pages, "_extract_search_page", side_effect=read_page),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                side_effect=lambda *a, **k: next(ids),
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=2,
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_promoted_job_ids",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            result = await reader.search_jobs("python", max_pages=2)
+
+        assert result["pagination"] == {
+            "pages_fetched": 2,
+            "next_offset": 50,
+            "next_cursor": None,
+            "reason": "complete",
+        }
+
+
+class TestLinkedInsRateLimitPageMidSearch:
+    @pytest.fixture
+    def stopped(self):
+        gate = pacing.Pacing(RateLimitConfig(), None)
+        pacing.install_gate(gate)
+        return gate
+
+    async def test_the_pages_read_before_it_are_kept(self, mock_page, stopped):
+        """Raised by the rate-limit check, it used to discard the whole search."""
+        from linkedin_mcp_server.core.exceptions import RateLimitError
+
+        reader = _reader(mock_page)
+
+        async def read_page(url, *args, **kwargs):
+            if "start=" in url:
+                stopped.record_pushback("slow_down_page")
+                raise RateLimitError("Rate limit detected", suggested_wait_time=300)
+            navigate(mock_page, url)
+            return captured(mock_page, extracted("Job results"))
+
+        with (
+            patch.object(reader._pages, "_extract_search_page", side_effect=read_page),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["101", "102"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.search_jobs("python", max_pages=3)
+
+        assert result["job_ids"] == ["101", "102"]
+        error = result["section_errors"]["search_results"]
+        assert (error["error_type"], error["retry_after"]) == ("rate_limit", 900)
+        assert result["pagination"]["reason"] == "rate_limited"
+        assert result["pagination"]["next_cursor"] == make_cursor(2, result["url"])
+
+    async def test_its_empty_page_says_when_to_come_back(self, mock_page, stopped):
+        reader = _reader(mock_page)
+        pages = iter([extracted("Job results"), extracted(RATE_LIMITED_SECTION_TEXT)])
+
+        async def read_page(url, *args, **kwargs):
+            navigate(mock_page, url)
+            if "start=" in url:
+                stopped.record_pushback("empty_page")
+            return captured(mock_page, next(pages))
+
+        with (
+            patch.object(reader._pages, "_extract_search_page", side_effect=read_page),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["101"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.search_jobs("python", max_pages=3)
+
+        assert result["section_errors"]["search_results"]["retry_after"] == 300
+        assert result["pagination"]["reason"] == "rate_limited"
+
+
+class TestSavedJobsAndLinkedInsRateLimitPage:
+    async def test_the_pages_read_before_it_are_kept(self, mock_page):
+        from linkedin_mcp_server.core.exceptions import RateLimitError
+
+        gate = pacing.Pacing(RateLimitConfig(), None)
+        pacing.install_gate(gate)
+        mock_page.url = "https://www.linkedin.com/jobs-tracker/?stage=saved"
+        reader = _reader(mock_page)
+
+        async def refused(*args, **kwargs):
+            gate.record_pushback("slow_down_page")
+            raise RateLimitError("Rate limit detected", suggested_wait_time=300)
+
+        answers = iter([captured(mock_page, extracted("Saved Job 1"))])
+
+        async def read_page(*args, **kwargs):
+            answer = next(answers, None)
+            if answer is None:
+                return await refused()
+            return answer
+
+        with (
+            patch.object(
+                reader._pages, "_extract_saved_jobs_page", side_effect=read_page
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["111"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=3)
+
+        assert result["job_ids"] == ["111"]
+        error = result["section_errors"]["saved_jobs"]
+        assert (error["error_type"], error["retry_after"]) == ("rate_limit", 900)
+        assert result["pagination"]["reason"] == "rate_limited"

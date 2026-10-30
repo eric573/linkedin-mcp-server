@@ -7,6 +7,7 @@ asked for, what it returned, and where its cursor resumes.
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
@@ -26,6 +27,7 @@ from linkedin_mcp_server.linkedin.paging import walk_result_pages
 from linkedin_mcp_server.linkedin.search_urls import (
     build_people_search_url,
     read_cursor,
+    results_digest,
 )
 
 
@@ -66,13 +68,17 @@ class ScriptedPages:
         self._on_capture = on_capture
         self.asked: list[int] = []
         self.plans: list[Any] = []
+        self.deadlines: list[Any] = []
         self._clock = clock
         self._seconds = seconds
         self._gate = gate
         self._gate_wait = gate_wait
 
-    async def capture(self, url: str, *, section_name: str, plan: Any):
+    async def capture(
+        self, url: str, *, section_name: str, plan: Any, deadline: Any = None
+    ):
         assert section_name == "search_results"
+        self.deadlines.append(deadline)
         page = int(parse_qs(urlparse(url).query).get("page", ["1"])[0])
         self.asked.append(page)
         self.plans.append(plan)
@@ -98,7 +104,7 @@ def resumes_at(result: dict[str, Any]) -> int:
     """The page the result's cursor resumes at, read the way the tool reads it."""
     cursor = result["pagination"]["next_cursor"]
     assert cursor is not None
-    return read_cursor(cursor, search_page(1), first=1)
+    return read_cursor(cursor, search_page(1), first=1).position
 
 
 class TestReadingPages:
@@ -150,22 +156,73 @@ class TestReadingPages:
         assert result["url"] == search_page(4)
         assert resumes_at(result) == 6
 
-    async def test_a_page_past_the_last_ends_the_walk_without_a_cursor(self):
-        """LinkedIn's no-results page links to nobody.
+    async def test_two_pages_without_results_end_the_walk_without_a_cursor(self):
+        """LinkedIn's no-results page links to nobody, and neither does the next.
 
-        Its text is dropped after real results, and the walk ends: a cursor
-        here would buy another page load for the same empty answer.
+        One such page after real results could be members shown without a
+        profile link, so it takes a second in a row to be the end. A cursor
+        there would buy another page load for the same empty answer.
         """
         pages = ScriptedPages(
-            {1: shown("Ada", people("ada")), 2: shown("No results found")}
+            {
+                1: shown("Ada", people("ada")),
+                2: shown("No results found"),
+                3: shown("No results found"),
+            }
         )
 
         result = await walk(pages, max_pages=5)
 
-        assert pages.asked == [1, 2]
-        assert result["sections"] == {"search_results": "Ada"}
+        assert pages.asked == [1, 2, 3]
+        assert result["sections"] == {"search_results": "Ada\n---\nNo results found"}
         assert result["pagination"] == {
-            "pages_fetched": 2,
+            "pages_fetched": 3,
+            "next_cursor": None,
+            "reason": "complete",
+        }
+
+    async def test_a_page_of_members_without_profile_links_is_passed(self):
+        """Out-of-network members show as cards with no link to a profile.
+
+        Their page is kept and the walk goes on to the people behind it,
+        where reading it as the end lost every page after it.
+        """
+        pages = ScriptedPages(
+            {
+                1: shown("Ada", people("ada")),
+                2: shown("LinkedIn Member\nLinkedIn Member"),
+                3: shown("Cy", people("cy")),
+            }
+        )
+
+        result = await walk(pages, max_pages=3)
+
+        assert pages.asked == [1, 2, 3]
+        assert result["sections"] == {
+            "search_results": "Ada\n---\nLinkedIn Member\nLinkedIn Member\n---\nCy"
+        }
+        assert result["pagination"]["reason"] == "max_pages"
+        assert resumes_at(result) == 4
+
+    async def test_a_resumed_page_without_results_after_one_ends_the_walk(self):
+        """The cursor remembers that the page before had none either."""
+        first = ScriptedPages(
+            {1: shown("Ada", people("ada")), 2: shown("No results found")}
+        )
+        result = await walk(first, max_pages=2)
+        assert result["pagination"]["reason"] == "max_pages"
+        resume = read_cursor(
+            result["pagination"]["next_cursor"], search_page(1), first=1
+        )
+
+        then = ScriptedPages({3: shown("No results found")})
+        ended = await walk(
+            then, first_page=resume.position, previous=resume.last_results
+        )
+
+        assert then.asked == [3]
+        assert ended["pagination"] == {
+            "pages_fetched": 1,
             "next_cursor": None,
             "reason": "complete",
         }
@@ -193,12 +250,16 @@ class TestReadingPages:
         """A people page that links only to companies has no people on it."""
         company: list[Reference] = [{"kind": "company", "url": "/company/acme/"}]
         pages = ScriptedPages(
-            {1: shown("Ada", people("ada")), 2: shown("Acme", company)}
+            {
+                1: shown("Ada", people("ada")),
+                2: shown("Acme", company),
+                3: shown("Acme again", company),
+            }
         )
 
-        result = await walk(pages, max_pages=3)
+        result = await walk(pages, max_pages=5)
 
-        assert pages.asked == [1, 2]
+        assert pages.asked == [1, 2, 3]
         assert result["pagination"]["reason"] == "complete"
 
 
@@ -413,3 +474,187 @@ class TestAPageCutShort:
         assert error["retry_after"] > 0
         assert result["pagination"]["reason"] == "rate_limited"
         assert resumes_at(result) == 2
+        # The page before it is what the re-read compares with, so the page
+        # read again is not taken for a repeat of itself.
+        resume = read_cursor(
+            result["pagination"]["next_cursor"], search_page(1), first=1
+        )
+        assert resume.last_results == results_digest(["/in/ada/"])
+
+
+class TestACallerPagingOnACursor:
+    async def test_paging_one_page_at_a_time_stops_on_a_repeated_page(self):
+        """LinkedIn serving the last page again past the end ends the loop.
+
+        Each call starts afresh, so only the cursor can remember what the page
+        before it held; without that, every call took the repeat for new
+        people and handed out another cursor.
+        """
+        repeated = shown("Bob", people("bob"))
+        pages = ScriptedPages(
+            {1: shown("Ada", people("ada")), **{n: repeated for n in range(2, 11)}}
+        )
+        cursor = None
+        returned = []
+        for _ in range(10):
+            resume = read_cursor(cursor, search_page(1), first=1)
+            result = await walk(
+                pages, first_page=resume.position, previous=resume.last_results
+            )
+            returned.append(result["sections"].get("search_results"))
+            cursor = result["pagination"]["next_cursor"]
+            if cursor is None:
+                break
+
+        assert pages.asked == [1, 2, 3]
+        assert returned == ["Ada", "Bob", None]
+        assert result["pagination"]["reason"] == "no_new_results"
+
+
+class TestWhereAPageLands:
+    async def test_a_page_linkedin_answers_with_another_is_a_failure(self):
+        """A dropped `page` serves page one again, under page two's number."""
+        pages = ScriptedPages(
+            {1: shown("Ada", people("ada")), 2: shown("Ada", people("ada"))}
+        )
+
+        result = await walk(pages, max_pages=3, landed_url=lambda: search_page(1))
+
+        assert pages.asked == [1, 2]
+        assert result["sections"] == {"search_results": "Ada"}
+        assert result["section_errors"]["search_results"]["error_type"] == (
+            "dropped_page"
+        )
+        assert "pagination" not in result
+
+    @pytest.mark.parametrize(
+        ("landed", "page", "on_page"),
+        [
+            (search_page(2) + "&sid=x&origin=GLOBAL_SEARCH_HEADER", 2, True),
+            (search_page(1), 1, True),
+            (search_page(1) + "&page=1", 1, True),
+            (search_page(1), 2, False),
+            (search_page(3), 2, False),
+            (
+                "https://www.linkedin.com/search/results/companies/?keywords=engineer&page=2",
+                2,
+                False,
+            ),
+            ("https://portal.invalid/search/results/people/?page=2", 2, False),
+        ],
+    )
+    def test_a_page_is_its_route_and_its_number(self, landed, page, on_page):
+        assert paging._on_page(landed, search_page(page), page) is on_page
+
+
+class TestTheLastPage:
+    async def test_a_cursor_past_the_last_page_reads_nothing(self):
+        pages = ScriptedPages({})
+
+        result = await walk(pages, first_page=101)
+
+        assert pages.asked == []
+        assert result["pagination"] == {
+            "pages_fetched": 0,
+            "next_cursor": None,
+            "reason": "complete",
+        }
+
+    async def test_the_walk_ends_at_the_last_page(self):
+        pages = ScriptedPages({100: shown("Ada", people("ada"))})
+
+        result = await walk(pages, first_page=100, max_pages=5)
+
+        assert pages.asked == [100]
+        assert result["pagination"]["reason"] == "complete"
+        assert result["pagination"]["next_cursor"] is None
+
+
+class TestLinkedInsOwnRateLimitPage:
+    @pytest.fixture
+    def stopped(self):
+        """A gate that LinkedIn's rate-limit page has just stopped."""
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+
+        gate = pacing.Pacing(RateLimitConfig(), None)
+        pacing.install_gate(gate)
+        return gate
+
+    async def test_raised_after_a_page_keeps_it_and_says_when(self, stopped):
+        from linkedin_mcp_server.core.exceptions import RateLimitError
+
+        def on_capture(page: int) -> None:
+            if page == 2:
+                stopped.record_pushback("slow_down_page")
+
+        pages = ScriptedPages(
+            {
+                1: shown("Ada", people("ada")),
+                2: RateLimitError("Rate limit detected", suggested_wait_time=300),
+            },
+            on_capture=on_capture,
+        )
+
+        result = await walk(pages, max_pages=3)
+
+        assert result["sections"] == {"search_results": "Ada"}
+        error = result["section_errors"]["search_results"]
+        assert (error["error_type"], error["retry_after"]) == ("rate_limit", 900)
+        assert result["pagination"]["reason"] == "rate_limited"
+        assert resumes_at(result) == 2
+
+    async def test_raised_before_any_page_is_the_answer(self, stopped):
+        from linkedin_mcp_server.core.exceptions import RateLimitError
+
+        pages = ScriptedPages({1: RateLimitError("Rate limit detected")})
+
+        with pytest.raises(RateLimitError):
+            await walk(pages, max_pages=3)
+
+    async def test_its_empty_page_says_when_to_come_back(self, stopped):
+        def on_capture(page: int) -> None:
+            if page == 2:
+                stopped.record_pushback("empty_page")
+
+        pages = ScriptedPages(
+            {1: shown("Ada", people("ada")), 2: shown(RATE_LIMITED_SECTION_TEXT)},
+            on_capture=on_capture,
+        )
+
+        result = await walk(pages, max_pages=3)
+
+        assert result["section_errors"]["search_results"]["retry_after"] == 300
+        assert resumes_at(result) == 2
+
+
+class TestTheWalksDeadline:
+    async def test_every_page_is_bounded_by_the_walks_time(self):
+        """Its navigations, and the retry of an empty page, end before the
+        call's own timeout would cancel everything read."""
+        pages = ScriptedPages(
+            {1: shown("Ada", people("ada")), 2: shown("Bob", people("bob"))}
+        )
+        before = time.monotonic()
+
+        await walk(pages, max_pages=2, tool_timeout=100.0)
+
+        assert all(deadline is not None for deadline in pages.deadlines)
+        assert 0 < pages.deadlines[0] - before <= 80.0 + 1.0
+
+    async def test_the_gates_wait_decides_whether_a_page_starts(self, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr(paging, "time", SimpleNamespace(monotonic=lambda: now[0]))
+        stub = SimpleNamespace(waited_seconds=0.0, expected_wait=lambda: 10.0)
+        monkeypatch.setattr(pacing, "gate", lambda: stub)
+        pages = ScriptedPages(
+            {n: shown(f"p{n}", people(f"person-{n}")) for n in range(1, 4)},
+            clock=now,
+            seconds=25.0,
+        )
+
+        result = await walk(pages, max_pages=3, tool_timeout=100.0)
+
+        # The third page would start at 50s, wait 10s and take 25s: 85s of
+        # the 80s allowed. Without the wait it fits, at 75s.
+        assert pages.asked == [1, 2]
+        assert result["pagination"]["reason"] == "time_budget"

@@ -74,7 +74,7 @@
       },
       "search_companies": {
         "coroutine": true,
-        "signature": "(self, keywords: 'str', *, max_pages: 'int' = 1, first_page: 'int' = 1, tool_timeout: 'float' = 180.0) -> 'dict[str, Any]'"
+        "signature": "(self, keywords: 'str', *, max_pages: 'int' = 1, first_page: 'int' = 1, last_results: 'str | None' = None, tool_timeout: 'float' = 180.0) -> 'dict[str, Any]'"
       },
       "search_conversations": {
         "coroutine": true,
@@ -86,7 +86,7 @@
       },
       "search_people": {
         "coroutine": true,
-        "signature": "(self, keywords: 'str', location: 'str | None' = None, network: 'list[str] | None' = None, current_company: 'str | None' = None, connection_of: 'str | None' = None, *, max_pages: 'int' = 1, first_page: 'int' = 1, tool_timeout: 'float' = 180.0) -> 'dict[str, Any]'"
+        "signature": "(self, keywords: 'str', location: 'str | None' = None, network: 'list[str] | None' = None, current_company: 'str | None' = None, connection_of: 'str | None' = None, *, max_pages: 'int' = 1, first_page: 'int' = 1, last_results: 'str | None' = None, tool_timeout: 'float' = 180.0) -> 'dict[str, Any]'"
       },
       "search_posts": {
         "coroutine": true,

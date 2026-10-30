@@ -199,6 +199,17 @@ def cut_short_retry_after() -> int:
     return _whole_seconds(gate().seconds_until_next_visit())
 
 
+def stop_retry_after() -> int | None:
+    """Whole seconds until a running stop ends, or None when none runs.
+
+    For a reader answering LinkedIn's own rate-limit page, which starts the
+    stop, so the caller is told when to come back and not just that it was
+    refused.
+    """
+    left = gate().stop_seconds_left()
+    return _whole_seconds(left) if left > 0 else None
+
+
 def mark_write_submitted() -> None:
     """Note that the running call has made a change it still has to confirm.
 
@@ -720,14 +731,17 @@ class Pacing:
                 )
             wait = max(pause, longest[0] if longest else 0.0)
             limit = _earliest(scope.deadline if scope else None, deadline)
+            # With no pause left to wait as well: a page started this close to
+            # the end is cancelled with the call, and everything read before
+            # it with it.
             if (
-                wait > 0
-                and limit is not None
+                limit is not None
                 and self._clock.monotonic() + wait + _PAGE_RESERVE_SECONDS > limit
             ):
+                waiting = f"to wait {_duration(wait)} " if wait > 0 else ""
                 raise PacingRefusedError(
-                    "Rate limit: this call has no time left to wait "
-                    f"{_duration(wait)} for its next page. Call again to continue.",
+                    f"Rate limit: this call has no time left {waiting}for its "
+                    "next page. Call again to continue.",
                     _whole_seconds(wait),
                     kind="time",
                 )

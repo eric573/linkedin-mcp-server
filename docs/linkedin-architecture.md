@@ -16,8 +16,8 @@ a page-owning collaborator.
 | Module | Canonical public owners | Source classification |
 | --- | --- | --- |
 | `__init__` | _(no public definitions)_ | `browser-free` |
-| `capture` | `CaptureMode`, `CapturePlan`, `OverlayRootNotFoundError`, `RATE_LIMIT_RETRY_DELAY`, `SectionCapture`, `capture_plan_for_url()` | `page-owning` |
-| `company` | `CompanyReader` | `browser-free` |
+| `capture` | `CaptureMode`, `CapturePlan`, `OverlayRootNotFoundError`, `RATE_LIMIT_RETRY_DELAY`, `RETRY_PAGE_ALLOWANCE`, `SectionCapture`, `capture_plan_for_url()` | `page-owning` |
+| `company` | `CompanyReader` | `page-owning` |
 | `connection` | `ActionSignals`, `ConnectionState`, `detect_connection_state()` | `browser-free` |
 | `connection_actions` | `ACTION_SIGNALS_JS`, `CLICK_INCOMING_ACCEPT_JS`, `ConnectionActions`, `OPEN_MORE_BUTTON_JS`, `ReadMainProfile` | `page-owning` |
 | `content` | `PageContentReader` | `page-owning` |
@@ -34,11 +34,11 @@ a page-owning collaborator.
 | `link_metadata` | `JOB_PATH_RE`, `RawReference`, `Reference`, `ReferenceKind`, `build_references()`, `choose_reference_text()`, `classify_link()`, `clean_heading()`, `clean_label()`, `dedupe_references()`, `derive_context()`, `normalize_reference()`, `normalize_url()` | `browser-free` |
 | `message_sender` | `MessageSender` | `page-owning` |
 | `navigation` | `PageNavigator`, `WaitUntil` | `page-owning` |
-| `paging` | `walk_result_pages()` | `browser-free` |
+| `paging` | `dropped_page_section_error()`, `walk_result_pages()` | `browser-free` |
 | `person` | `PersonReader` | `page-owning` |
 | `posts` | `PostSearch` | `browser-free` |
 | `profile_page` | `MessageTarget`, `MessageTargetResolution`, `ProfilePageReader`, `ReadMessageTarget` | `browser-free` |
-| `search_urls` | `CONTENT_DATE_POSTED_MAP`, `CONTENT_TYPE_MAP`, `EXPERIENCE_LEVEL_MAP`, `JOB_DATE_POSTED_MAP`, `JOB_TYPE_MAP`, `NETWORK_TOKENS`, `SORT_BY_MAP`, `WORK_TYPE_MAP`, `build_company_search_url()`, `build_content_search_url()`, `build_job_search_url()`, `build_people_search_url()`, `make_cursor()`, `next_cursor()`, `read_cursor()`, `search_fingerprint()` | `browser-free` |
+| `search_urls` | `CONTENT_DATE_POSTED_MAP`, `CONTENT_TYPE_MAP`, `EXPERIENCE_LEVEL_MAP`, `JOB_DATE_POSTED_MAP`, `JOB_TYPE_MAP`, `LAST_RESULT_PAGE`, `NETWORK_TOKENS`, `ResumePoint`, `SORT_BY_MAP`, `WORK_TYPE_MAP`, `build_company_search_url()`, `build_content_search_url()`, `build_job_search_url()`, `build_people_search_url()`, `make_cursor()`, `next_cursor()`, `read_cursor()`, `results_digest()`, `search_fingerprint()` | `browser-free` |
 | `session` | `PageSession` | `page-owning` |
 | `text` | `DETAIL_CAPTURE_EN_US`, `DetailCaptureTextTable`, `JOB_APPLY_EN_US`, `JOB_POSTING_EN_US`, `JOB_SEARCH_EN_US`, `JobApplyTextTable`, `JobPostingTextTable`, `JobSearchTextTable`, `SIDEBAR_CHROME_EN`, `SidebarChromeTable`, `filter_linkedin_noise_lines()`, `strip_conversation_chrome()`, `strip_linkedin_noise()`, `truncate_linkedin_noise()` | `browser-free` |
 
