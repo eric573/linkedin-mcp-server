@@ -20,6 +20,7 @@ from linkedin_mcp_server.linkedin.capture import (
 )
 from linkedin_mcp_server.linkedin.contracts import (
     RATE_LIMITED_SECTION_TEXT,
+    cut_short_section_error,
     rate_limited_section_error,
 )
 from linkedin_mcp_server.linkedin.identifiers import job_view_url, normalize_job_id
@@ -107,6 +108,7 @@ class JobReader:
         """
         job_id = normalize_job_id(job_id)
         url = job_view_url(job_id, "/")
+        held_back = pacing.loads_held_back()
         extracted = await self._capture.capture(
             url,
             section_name="job_posting",
@@ -124,6 +126,10 @@ class JobReader:
                 )
             if not JOB_POSTING_EN_US.has_description(extracted.text):
                 section_errors["job_posting"] = missing_description_section_error()
+            elif pacing.loads_held_back() > held_back:
+                section_errors["job_posting"] = cut_short_section_error(
+                    pacing.cut_short_retry_after()
+                )
         elif extracted.text == RATE_LIMITED_SECTION_TEXT:
             section_errors["job_posting"] = rate_limited_section_error()
         elif extracted.error:
@@ -567,6 +573,11 @@ class JobReader:
                 # stand, and `pagination` says where to resume and why.
                 if not page_texts:
                     raise
+                # No time left for the gate's wait is the search's own time
+                # budget running out, not LinkedIn or a limit.
+                if refused.kind == "time":
+                    stop_reason = "time_budget"
+                    break
                 section_errors["search_results"] = rate_limited_section_error(
                     str(refused), retry_after=refused.retry_after
                 )
@@ -701,6 +712,7 @@ class JobReader:
                 else f"{base_url}&start={page_num * SAVED_JOBS_PAGE_SIZE}"
             )
 
+            held_back = pacing.loads_held_back()
             try:
                 capture = await self._pages._extract_saved_jobs_page(
                     url, section_name="saved_jobs"
@@ -828,6 +840,15 @@ class JobReader:
                 page_texts.append(extracted.text)
                 if extracted.references:
                     page_references.extend(extracted.references)
+                # The rate limit stopped this page loading all of its jobs.
+                # They are kept, and the cursor reads the page again rather
+                # than skip the ones it held back.
+                if pacing.loads_held_back() > held_back:
+                    section_errors["saved_jobs"] = cut_short_section_error(
+                        pacing.cut_short_retry_after()
+                    )
+                    stop_reason = "rate_limited"
+                    break
 
             except PacingRefusedError as refused:
                 # As in the search: keep the pages read, say when the rest
@@ -835,6 +856,9 @@ class JobReader:
                 # was read.
                 if not page_texts:
                     raise
+                if refused.kind == "time":
+                    stop_reason = "time_budget"
+                    break
                 section_errors["saved_jobs"] = rate_limited_section_error(
                     str(refused), retry_after=refused.retry_after
                 )

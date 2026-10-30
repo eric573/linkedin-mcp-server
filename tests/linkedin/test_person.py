@@ -66,6 +66,17 @@ def extracted(
     return ExtractedSection(text=text, references=references or [], error=error)
 
 
+def _hold_back_loads() -> None:
+    """Make the gate refuse the in-page loads a page asks for, as a stop does."""
+    from linkedin_mcp_server.config.schema import RateLimitConfig
+    from linkedin_mcp_server.core import pacing
+
+    gate = pacing.Pacing(RateLimitConfig(), None)
+    gate.record_pushback("http_429")
+    pacing.install_gate(gate)
+    assert gate.loads_allowed(1) == 0
+
+
 class TestReadPersonUrls:
     """Test that read_person visits the correct URLs per section set."""
 
@@ -1846,6 +1857,38 @@ class TestSidebarProgramText:
 
         with pytest.raises(ValueError, match="cannot be quoted"):
             spec.loader.exec_module(probe)
+
+
+class TestASectionCutShort:
+    async def test_a_section_the_rate_limit_stopped_loading_says_so(self, mock_page):
+        """Kept, and marked partial: a shorter list alone reads as complete."""
+        from linkedin_mcp_server.core import pacing
+
+        reader = _reader(mock_page)
+
+        async def capture(url, *args, **kwargs):
+            if "/details/experience/" in url:
+                _hold_back_loads()
+                return extracted("Engineer at A")
+            return extracted("profile text")
+
+        with (
+            patch.object(reader._capture, "capture", side_effect=capture),
+            patch.object(
+                reader._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            pacing.tool_call(deadline=None),
+        ):
+            result = await reader.read_person("testuser", {"experience"})
+
+        assert result["sections"]["experience"] == "Engineer at A"
+        assert "main_profile" not in result.get("section_errors", {})
+        error = result["section_errors"]["experience"]
+        assert error["error_type"] == "rate_limit"
+        assert error["retry_after"] > 0
 
 
 class TestSearchPeople:

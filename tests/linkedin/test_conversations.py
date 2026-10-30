@@ -118,24 +118,63 @@ class TestStripSelectConversationPrefix:
         assert strip_select_conversation_prefix("") == ""
 
 
-def _row(name: str, thread_id: str) -> dict[str, str]:
-    """One attributed row as the browser program returns it."""
-    return {"ariaLabel": f"Select conversation with {name}", "threadId": thread_id}
-
-
-def _outcome(
-    *rows: dict[str, str],
-    stopped_at: dict[str, Any] | None = None,
-    first_index_gap: dict[str, Any] | None = None,
-    start_thread_id: str | None = None,
+def _listed(
+    aria_label: str,
+    opens: str | None = None,
+    *,
+    matches: bool = True,
+    clickable: bool = True,
 ) -> dict[str, Any]:
-    """The row program's raw return value."""
+    """One row as the listing program reads it, and the thread its click opens.
+
+    ``opens`` None is a click that opened nothing within the poll budget.
+    """
     return {
-        "rows": list(rows),
-        "stoppedAt": stopped_at,
-        "firstIndexGap": first_index_gap,
-        "startThreadId": start_thread_id,
+        "ariaLabel": aria_label,
+        "matches": matches,
+        "clickable": clickable,
+        "opens": opens,
     }
+
+
+def _row(name: str, thread_id: str | None) -> dict[str, Any]:
+    """A row whose click opens *thread_id*, or nothing when it is None."""
+    return _listed(f"Select conversation with {name}", thread_id)
+
+
+def _sidebar(
+    *rows: dict[str, Any],
+    start_thread_id: str | None = None,
+    log: list[tuple[str, Any]] | None = None,
+    on_click: Any = None,
+) -> AsyncMock:
+    """A page answering the listing program and then each row's click.
+
+    *log* collects ``("list", arg)`` and ``("click", arg)`` in the order the
+    programs ran. *on_click* runs before a click answers, as LinkedIn's
+    answer to it would arrive.
+    """
+
+    async def evaluate(js: str, arg: Any = None) -> Any:
+        if "__linkedinMcpConversationRows = labels" in js:
+            if log is not None:
+                log.append(("list", arg))
+            return {
+                "startThreadId": start_thread_id,
+                "rows": [
+                    {key: row[key] for key in ("ariaLabel", "matches", "clickable")}
+                    for row in rows
+                ],
+            }
+        if "clickTarget.click()" in js:
+            if log is not None:
+                log.append(("click", arg))
+            if on_click is not None:
+                on_click(arg)
+            return {"threadId": rows[arg["position"]]["opens"]}
+        raise AssertionError(f"unexpected page program: {js[:80]!r}")
+
+    return AsyncMock(side_effect=evaluate)
 
 
 def _scan(
@@ -233,21 +272,24 @@ class TestExtractConversationThreadRefs:
         and a filter that never arrives clicks every row in the sidebar.
         """
         reader = _reader(mock_page)
-        captured: dict[str, object] = {}
-
-        async def fake_evaluate(_js: str, arg: dict | None = None) -> dict:
-            captured["arg"] = arg
-            return _outcome()
-
-        mock_page.evaluate = fake_evaluate
+        log: list[tuple[str, Any]] = []
+        mock_page.evaluate = _sidebar(
+            _row("Jacki McMahan", "2-j"),
+            _listed("Select conversation with Bob", "2-b", matches=False),
+            log=log,
+        )
 
         await reader._extract_conversation_thread_refs(
             limit=50, context="inbox", name_filter="Jacki McMahan"
         )
 
-        arg = captured["arg"]
-        assert isinstance(arg, dict)
-        assert (arg["limit"], arg["nameFilter"]) == (50, "Jacki McMahan")
+        assert log == [
+            ("list", {"nameFilter": "Jacki McMahan"}),
+            (
+                "click",
+                {"position": 0, "ariaLabel": "Select conversation with Jacki McMahan"},
+            ),
+        ]
 
     async def test_rows_that_never_attach_return_nothing_and_click_nothing(
         self, mock_page
@@ -265,7 +307,7 @@ class TestExtractConversationThreadRefs:
         mock_page.wait_for_selector = AsyncMock(
             side_effect=PlaywrightTimeoutError("no rows")
         )
-        mock_page.evaluate = AsyncMock(return_value=_outcome())
+        mock_page.evaluate = _sidebar()
         scroll = AsyncMock()
 
         with patch.object(reader, "_scroll_main_scrollable_region", scroll):
@@ -285,7 +327,7 @@ class TestExtractConversationThreadRefs:
         labels are reliably attached and not reliably visible.
         """
         reader = _reader(mock_page)
-        mock_page.evaluate = AsyncMock(return_value=_outcome())
+        mock_page.evaluate = _sidebar()
 
         await reader._extract_conversation_thread_refs(limit=None, context="inbox")
 
@@ -309,17 +351,19 @@ class TestExtractConversationThreadRefs:
         async def wait_for_selector(*_args: Any, **_kwargs: Any) -> None:
             order.append("wait")
 
+        loaded = [_row("Ada", "2-ada")]
+
         async def evaluate(js: str, arg: Any = None) -> Any:
             nonlocal scrolled
             if "isScrollable" in js:
                 order.append("scroll")
                 scrolled += 1
+                if scrolled == 2:
+                    loaded.append(_row("Grace", "2-grace"))
                 return True
-            order.append("rows")
-            rows = [_row("Ada", "2-ada")]
-            if scrolled >= 2:
-                rows.append(_row("Grace", "2-grace"))
-            return _outcome(*rows)
+            if "__linkedinMcpConversationRows = labels" in js:
+                order.append("rows")
+            return await _sidebar(*loaded)(js, arg)
 
         mock_page.wait_for_selector = wait_for_selector
         mock_page.evaluate = evaluate
@@ -337,9 +381,7 @@ class TestExtractConversationThreadRefs:
     async def test_every_ref_carries_the_callers_context_label(self, mock_page):
         """The label is how a consumer tells an inbox row from a search hit."""
         reader = _reader(mock_page)
-        mock_page.evaluate = AsyncMock(
-            return_value=_outcome(_row("Jacki McMahan", "2-aaa"))
-        )
+        mock_page.evaluate = _sidebar(_row("Jacki McMahan", "2-aaa"))
 
         outcome = await reader._extract_conversation_thread_refs(
             limit=None, context="search_results"
@@ -359,11 +401,7 @@ class TestExtractConversationThreadRefs:
         participant, and the resolver's exact-equality match would accept it
         for a display name that stripped to nothing."""
         reader = _reader(mock_page)
-        mock_page.evaluate = AsyncMock(
-            return_value=_outcome(
-                {"ariaLabel": "Select conversation with ", "threadId": "2-aaa"}
-            )
-        )
+        mock_page.evaluate = _sidebar(_listed("Select conversation with ", "2-aaa"))
 
         outcome = await reader._extract_conversation_thread_refs(
             limit=None, context="inbox"
@@ -387,17 +425,13 @@ class TestExtractConversationThreadRefs:
         scan would read as complete.
         """
         reader = _reader(mock_page)
-        mock_page.evaluate = AsyncMock(
-            return_value=_outcome(
-                _row("Tess", "2-t"),
-                stopped_at={"ariaLabel": "", "position": 3},
-                first_index_gap={
-                    "ariaLabel": "Select conversation with Tess",
-                    "position": 1,
-                    "precededBy": 1,
-                },
-                start_thread_id="2-open",
-            )
+        mock_page.evaluate = _sidebar(
+            _row("Tess", "2-t"),
+            _listed("Select conversation with Tess", clickable=False),
+            _listed("Select conversation with Uma", "2-u", matches=False),
+            _listed("", None),
+            _row("Tess", "2-never"),
+            start_thread_id="2-open",
         )
 
         outcome = await reader._extract_conversation_thread_refs(
@@ -417,7 +451,7 @@ class TestExtractConversationThreadRefs:
         self, mock_page
     ):
         reader = _reader(mock_page)
-        mock_page.evaluate = AsyncMock(return_value=_outcome())
+        mock_page.evaluate = _sidebar()
 
         outcome = await reader._extract_conversation_thread_refs(
             limit=None, context="inbox"
@@ -570,7 +604,7 @@ class TestResolveConversationThreadUrls:
         mock_page.wait_for_selector = AsyncMock(
             side_effect=[PlaywrightTimeoutError("no rows"), None]
         )
-        mock_page.evaluate = AsyncMock(return_value=_outcome(_row(JACKI, "2-found")))
+        mock_page.evaluate = _sidebar(_row(JACKI, "2-found"))
         nav_mock = AsyncMock()
         scroll = AsyncMock()
         with (
@@ -584,7 +618,8 @@ class TestResolveConversationThreadUrls:
             COMPOSE,
             SEARCH_JACKI,
         ]
-        mock_page.evaluate.assert_awaited_once()
+        # The listing and the one click, both on the search leg.
+        assert mock_page.evaluate.await_count == 2
         scroll.assert_not_awaited()
         assert resolution == _ThreadResolution([_thread("2-found")])
 
@@ -967,6 +1002,46 @@ class TestGetInbox:
             "sections": {"inbox": "Conversation A\nConversation B"},
         }
 
+    @pytest.mark.parametrize("text", ["Conversation A", ""], ids=["read", "empty"])
+    async def test_a_refused_compose_page_keeps_the_inbox_already_read(
+        self, mock_page, text
+    ):
+        """The inbox text stands when the rate limit refuses the thread links.
+
+        Nothing read means the refusal is the answer, as everywhere else.
+        """
+        from linkedin_mcp_server.core.pacing import PacingRefusedError
+
+        reader = _reader(mock_page)
+        refused = PacingRefusedError("Rate limit stop: LinkedIn answered 429", 900)
+
+        async def navigate(url: str) -> None:
+            if url == COMPOSE:
+                raise refused
+
+        with (
+            patch.object(PageNavigator, "_navigate_to_page", side_effect=navigate),
+            patch.object(reader, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                reader, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(
+                PageContentReader,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value=_root(text),
+            ),
+        ):
+            if not text:
+                with pytest.raises(PacingRefusedError):
+                    await reader.get_inbox(limit=10)
+                return
+            result = await reader.get_inbox(limit=10)
+
+        assert result["sections"] == {"inbox": "Conversation A"}
+        error = result["section_errors"]["inbox"]
+        assert (error["error_type"], error["retry_after"]) == ("rate_limit", 900)
+
     async def test_an_empty_inbox_omits_the_optional_keys(self, mock_page):
         """``sections`` stays but is empty, and ``references`` is absent.
 
@@ -1319,6 +1394,79 @@ class TestGetInbox:
 
         assert [call.args[0] for call in nav.await_args_list] == [MESSAGING, COMPOSE]
         scan.assert_not_awaited()
+
+
+def _hold_back_loads() -> None:
+    """Make the gate refuse the in-page loads a page asks for, as a stop does."""
+    from linkedin_mcp_server.config.schema import RateLimitConfig
+    from linkedin_mcp_server.core import pacing
+
+    gate = pacing.Pacing(RateLimitConfig(), None)
+    gate.record_pushback("http_429")
+    pacing.install_gate(gate)
+    assert gate.loads_allowed(1) == 0
+
+
+class TestListsCutShort:
+    """A list the rate limit stopped scrolling says so beside what it showed."""
+
+    async def test_an_inbox_scrolled_short(self, mock_page):
+        from linkedin_mcp_server.core import pacing
+
+        reader = _reader(mock_page)
+
+        async def scroll(**_kwargs: Any) -> None:
+            _hold_back_loads()
+
+        with (
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch.object(reader, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(reader, "_scroll_main_scrollable_region", side_effect=scroll),
+            patch.object(
+                PageContentReader,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value=_root("Conversation A"),
+            ),
+            patch.object(
+                reader,
+                "_extract_conversation_thread_refs",
+                new_callable=AsyncMock,
+                return_value=_scan(),
+            ),
+            pacing.tool_call(deadline=None),
+        ):
+            result = await reader.get_inbox(limit=10)
+
+        assert result["sections"] == {"inbox": "Conversation A"}
+        assert result["section_errors"]["inbox"]["error_type"] == "rate_limit"
+
+    async def test_a_thread_scrolled_short(self, mock_page):
+        from linkedin_mcp_server.core import pacing
+
+        reader = _reader(mock_page)
+
+        async def scroll(**_kwargs: Any) -> None:
+            _hold_back_loads()
+
+        with (
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch.object(reader, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(reader, "_scroll_main_scrollable_region", side_effect=scroll),
+            patch.object(
+                PageContentReader,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value=_root("Hello!"),
+            ),
+            pacing.tool_call(deadline=None),
+        ):
+            result = await reader.get_conversation(thread_id="abc123")
+
+        assert result["sections"]["conversation"] == "Hello!"
+        error = result["section_errors"]["conversation"]
+        assert error["error_type"] == "rate_limit"
+        assert error["retry_after"] > 0
 
 
 class TestGetConversation:
@@ -1860,25 +2008,21 @@ class TestConversationOpensArePaced:
         self, mock_page, gate
     ):
         reader = _reader(mock_page)
-        captured: dict[str, Any] = {}
-        rows = [
-            {"ariaLabel": f"Select conversation with Person {n}", "threadId": f"t{n}"}
-            for n in range(3)
-        ]
-
-        async def fake_evaluate(_js: str, arg: dict | None = None) -> dict:
-            captured["arg"] = arg
-            return {**_outcome(*rows), "rowCount": 20}
-
-        mock_page.evaluate = fake_evaluate
-
-        scan = await reader._extract_conversation_thread_refs(limit=20, context="inbox")
-
-        assert captured["arg"]["limit"] == 3
-        assert (captured["arg"]["pauseLowMs"], captured["arg"]["pauseHighMs"]) == (
-            1500.0,
-            3000.0,
+        log: list[tuple[str, Any]] = []
+        mock_page.evaluate = _sidebar(
+            *(_row(f"Person {n}", f"t{n}") for n in range(20)), log=log
         )
+
+        with patch.object(PageSession, "delay", new_callable=AsyncMock) as delay:
+            scan = await reader._extract_conversation_thread_refs(
+                limit=20, context="inbox"
+            )
+
+        assert [kind for kind, _ in log].count("click") == 3
+        # Each click waits its own pause first, drawn from the open range.
+        pauses = [call.args[0] for call in delay.await_args_list]
+        assert len(pauses) == 3
+        assert all(1.5 <= pause <= 3.0 for pause in pauses)
         assert len(scan.refs) == 3
         assert scan.held_back == 17
         assert gate.status()["visits"]["last_hour"] == 3
@@ -1890,45 +2034,105 @@ class TestConversationOpensArePaced:
 
     async def test_a_click_that_opened_nothing_is_counted_too(self, mock_page, gate):
         reader = _reader(mock_page)
-
-        async def fake_evaluate(_js: str, arg: dict | None = None) -> dict:
-            return _outcome(
-                {"ariaLabel": "Select conversation with Ada", "threadId": "t1"},
-                stopped_at={"ariaLabel": "Select conversation with Bo", "position": 1},
-            )
-
-        mock_page.evaluate = fake_evaluate
+        mock_page.evaluate = _sidebar(_row("Ada", "t1"), _row("Bo", None))
 
         await reader._extract_conversation_thread_refs(limit=3, context="inbox")
 
         assert gate.status()["visits"]["last_hour"] == 2
+
+    async def test_each_click_is_counted_before_it_is_made(self, mock_page, gate):
+        """A scan the page cuts short has already counted the click that went out.
+
+        A redirect, a cancel or a crashed renderer ends the scan inside the
+        click, after the request may have left.
+        """
+        reader = _reader(mock_page)
+        counted_at_click: list[int] = []
+
+        def on_click(arg: Any) -> None:
+            counted_at_click.append(gate.status()["visits"]["last_hour"])
+            if arg["position"] == 1:
+                raise RuntimeError("Execution context was destroyed")
+
+        mock_page.evaluate = _sidebar(
+            _row("Ada", "t1"), _row("Bo", "t2"), on_click=on_click
+        )
+
+        with pytest.raises(RuntimeError):
+            await reader._extract_conversation_thread_refs(limit=3, context="inbox")
+
+        assert counted_at_click == [1, 2]
+        assert gate.status()["visits"]["last_hour"] == 2
+
+    async def test_a_stop_that_starts_partway_ends_the_listing(self, mock_page, gate):
+        """LinkedIn refusing one thread stops the clicks that would have followed."""
+        reader = _reader(mock_page)
+        log: list[tuple[str, Any]] = []
+
+        def on_click(arg: Any) -> None:
+            if arg["position"] == 1:
+                gate.record_pushback("http_429", retry_after=None)
+
+        mock_page.evaluate = _sidebar(
+            *(_row(f"Person {n}", f"t{n}") for n in range(3)),
+            log=log,
+            on_click=on_click,
+        )
+
+        scan = await reader._extract_conversation_thread_refs(limit=3, context="inbox")
+
+        assert [arg["position"] for kind, arg in log if kind == "click"] == [0, 1]
+        assert [ref["url"] for ref in scan.refs] == [
+            "/messaging/thread/t0/",
+            "/messaging/thread/t1/",
+        ]
+        assert scan.held_back == 1
+        assert scan.retry_after is not None and scan.retry_after > 0
+
+    async def test_a_stop_that_starts_partway_refuses_a_named_scan(
+        self, mock_page, gate
+    ):
+        """Cut short, a named scan would renumber the threads `index` picks from."""
+        from linkedin_mcp_server.core import pacing
+
+        reader = _reader(mock_page)
+        log: list[tuple[str, Any]] = []
+
+        def on_click(arg: Any) -> None:
+            gate.record_pushback("http_429", retry_after=None)
+
+        mock_page.evaluate = _sidebar(
+            _row("Ada", "t0"), _row("Ada", "t1"), log=log, on_click=on_click
+        )
+
+        with pytest.raises(pacing.PacingRefusedError):
+            await reader._extract_conversation_thread_refs(
+                limit=None, context="search", name_filter="Ada"
+            )
+
+        assert [kind for kind, _ in log] == ["list", "click"]
 
     async def test_a_named_scan_runs_whole_or_not_at_all(self, mock_page, gate):
         """Cut short, it would renumber the threads `index` picks from."""
         from linkedin_mcp_server.core import pacing
 
         reader = _reader(mock_page)
-        captured: dict[str, Any] = {}
-
-        async def fake_evaluate(_js: str, arg: dict | None = None) -> dict:
-            captured["arg"] = arg
-            return _outcome()
-
-        mock_page.evaluate = fake_evaluate
+        log: list[tuple[str, Any]] = []
+        mock_page.evaluate = _sidebar(_row("Ada", "t0"), _row("Ada", "t1"), log=log)
         gate.record_conversation_opens(2)
 
-        await reader._extract_conversation_thread_refs(
+        # One visit left, and both of Ada's rows are opened all the same.
+        scan = await reader._extract_conversation_thread_refs(
             limit=None, context="search", name_filter="Ada"
         )
-        assert captured["arg"]["limit"] is None
+        assert len(scan.refs) == 2
 
-        gate.record_conversation_opens(1)
-        captured.clear()
+        log.clear()
         with pytest.raises(pacing.PacingRefusedError):
             await reader._extract_conversation_thread_refs(
                 limit=None, context="search", name_filter="Ada"
             )
-        assert captured == {}
+        assert log == []
 
     async def test_list_scrolls_are_counted_paced_and_stop_with_the_budget(
         self, mock_page, gate

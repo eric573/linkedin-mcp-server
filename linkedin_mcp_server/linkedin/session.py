@@ -101,7 +101,8 @@ class PageSession:
     ) -> int | None:
         """Scroll the page body through the shared utility boundary.
 
-        Returns how many scrolls were made, when the boundary says.
+        Every scroll that loads more is paced and counted by the rate limit
+        inside the boundary. Returns how many did, when the boundary says.
         """
         return await scroll_to_bottom(
             self.page,

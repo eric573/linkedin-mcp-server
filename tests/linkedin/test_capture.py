@@ -2399,22 +2399,30 @@ class TestLoadsArePaced:
         assert gate.loads_allowed(1) == 0
 
     @pytest.mark.parametrize(
-        ("url", "mode"),
+        ("url", "mode", "pause"),
         [
             (
                 "https://www.linkedin.com/in/billgates/recent-activity/all/",
                 CaptureMode.ACTIVITY,
+                1.0,
             ),
             (
                 "https://www.linkedin.com/search/results/content/?keywords=x",
                 CaptureMode.SEARCH_RESULTS | CaptureMode.POST_PERMALINKS,
+                0.5,
             ),
+            ("https://www.linkedin.com/in/billgates/", CaptureMode.STANDARD, 0.5),
         ],
-        ids=("activity", "post-search"),
+        ids=("activity", "post-search", "profile"),
     )
-    async def test_an_endless_list_scrolls_only_as_far_as_the_budget_allows(
-        self, mock_page, gate, url, mode
+    async def test_every_page_hands_its_scroll_to_the_counted_scroll(
+        self, mock_page, gate, url, mode, pause
     ):
+        """The scroll asks the rate limit itself (`core/utils.py`), whatever the page.
+
+        So the capture passes the list's own depth and pause, and does not
+        count a second time what the scroll counted.
+        """
         mock_page.evaluate = AsyncMock(
             return_value={"source": "root", "text": "Posts", "references": []}
         )
@@ -2432,29 +2440,6 @@ class TestLoadsArePaced:
 
         scrolled = scroll.await_args
         assert scrolled is not None
-        assert scrolled.kwargs["max_scrolls"] == 5
-        # A second apart at least, stretched at random, whatever the list's own
-        # pause: post search asks for half a second.
-        assert 1.0 <= scrolled.kwargs["pause_time"] <= 1.5
-        assert gate.loads_allowed(1) == 0
-
-    async def test_scrolling_a_page_already_loaded_costs_nothing(self, mock_page, gate):
-        mock_page.evaluate = AsyncMock(
-            return_value={"source": "root", "text": "Profile", "references": []}
-        )
-        mock_page.wait_for_function = AsyncMock()
-        scroll = AsyncMock(return_value=5)
-        capture = _capture(mock_page)
-
-        boundaries = self._boundaries(scroll)
-        with boundaries[0], boundaries[1], boundaries[2], boundaries[3]:
-            await capture._capture_once(
-                "https://www.linkedin.com/in/billgates/",
-                section_name="main_profile",
-                plan=CapturePlan(),
-            )
-
-        scrolled = scroll.await_args
-        assert scrolled is not None
-        assert scrolled.kwargs == {"pause_time": 0.5, "max_scrolls": 5}
-        assert gate.loads_allowed(5) == 5
+        assert scrolled.kwargs["max_scrolls"] == 20
+        assert scrolled.kwargs["pause_time"] == pause
+        assert gate.loads_allowed(10) == 5

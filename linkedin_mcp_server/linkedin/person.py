@@ -12,6 +12,7 @@ from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.destination import is_linkedin_landing
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
@@ -21,6 +22,7 @@ from linkedin_mcp_server.linkedin.capture import (
 )
 from linkedin_mcp_server.linkedin.contracts import (
     RATE_LIMITED_SECTION_TEXT,
+    cut_short_section_error,
     rate_limited_section_error,
 )
 from linkedin_mcp_server.linkedin.fields import PERSON_SECTIONS, _person_section_specs
@@ -243,6 +245,7 @@ class PersonReader:
             for i, spec in enumerate(requested_ordered):
                 section_name = spec.name
                 url = base_url + spec.suffix
+                held_back = pacing.loads_held_back()
                 try:
                     can_reuse_main = (
                         section_name == "main_profile"
@@ -283,6 +286,12 @@ class PersonReader:
                         sections[section_name] = extracted.text
                         if extracted.references:
                             references[section_name] = extracted.references
+                        # Kept, and said to be partial: the rate limit stopped
+                        # it loading more, so it is shorter than the profile.
+                        if pacing.loads_held_back() > held_back:
+                            section_errors[section_name] = cut_short_section_error(
+                                pacing.cut_short_retry_after()
+                            )
                     elif extracted.text == RATE_LIMITED_SECTION_TEXT:
                         section_errors[section_name] = rate_limited_section_error()
                         # Stop rather than walk the remaining sections. Each one

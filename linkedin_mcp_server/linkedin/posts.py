@@ -9,7 +9,11 @@ from linkedin_mcp_server.linkedin.capture import (
     CapturePlan,
     SectionCapture,
 )
-from linkedin_mcp_server.linkedin.contracts import RATE_LIMITED_SECTION_TEXT
+from linkedin_mcp_server.core import pacing
+from linkedin_mcp_server.linkedin.contracts import (
+    RATE_LIMITED_SECTION_TEXT,
+    cut_short_section_error,
+)
 from linkedin_mcp_server.linkedin.link_metadata import Reference
 from linkedin_mcp_server.linkedin.search_urls import build_content_search_url
 
@@ -77,6 +81,7 @@ class PostSearch:
             keywords, date_posted=date_posted, content_type=content_type
         )
         max_scrolls = max(1, max_pages) * _CONTENT_SCROLLS_PER_REQUESTED_PAGE
+        held_back = pacing.loads_held_back()
         extracted = await self._capture.capture(
             url,
             section_name="search_results",
@@ -93,6 +98,11 @@ class PostSearch:
             sections["search_results"] = extracted.text
             if extracted.references:
                 references["search_results"] = extracted.references
+            # An endless list the rate limit stopped scrolling ends early.
+            if pacing.loads_held_back() > held_back:
+                section_errors["search_results"] = cut_short_section_error(
+                    pacing.cut_short_retry_after()
+                )
         elif extracted.text == RATE_LIMITED_SECTION_TEXT:
             section_errors["search_results"] = {
                 "error_type": "rate_limit",

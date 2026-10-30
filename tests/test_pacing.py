@@ -125,6 +125,42 @@ class TestPause:
         assert clock.slept == [pytest.approx(pause)]
 
 
+class TestPauseAfterInPageLoads:
+    """The next page visit is paced from the last thing that loaded."""
+
+    async def test_a_thread_opened_after_the_page_restarts_the_full_pause(
+        self, clock, record_path
+    ):
+        gate = make_gate(clock, record_path)  # pause 3-6, pinned to 4.5
+        with pacing.tool_call(deadline=None):
+            await visit(gate)
+            clock.advance(10.0)
+            gate.record_conversation_opens(1)
+            clock.advance(1.0)
+            await gate.before_visit(_PROFILE)
+        assert clock.slept == [pytest.approx(3.5)]
+
+    async def test_a_load_after_the_page_restarts_a_loads_pause(
+        self, clock, record_path
+    ):
+        gate = make_gate(clock, record_path)  # load pause 1.0 x 1.25 at midpoint
+        with pacing.tool_call(deadline=None):
+            await visit(gate)
+            clock.advance(10.0)
+            gate.record_loads(1)
+            clock.advance(0.5)
+            await gate.before_visit(_PROFILE)
+        assert clock.slept == [pytest.approx(0.75)]
+
+    async def test_a_load_never_shortens_a_longer_pause(self, clock, record_path):
+        gate = make_gate(clock, record_path)
+        with pacing.tool_call(deadline=None):
+            await visit(gate)
+            gate.record_loads(1)
+            await gate.before_visit(_PROFILE)
+        assert clock.slept == [pytest.approx(4.5)]
+
+
 class TestBudget:
     async def test_a_call_is_refused_once_the_hour_is_used_up(self, clock, record_path):
         gate = make_gate(
@@ -244,15 +280,49 @@ class TestBudget:
             with pytest.raises(PacingRefusedError):
                 await gate.before_visit(_PROFILE)
 
-    async def test_outside_a_tool_call_nothing_is_refused_only_paced(
+    async def test_outside_a_tool_call_a_short_wait_is_waited_out(
         self, clock, record_path
     ):
-        gate = make_gate(clock, record_path, visits_per_hour=1)
-        gate.record_pushback("http_429")
+        gate = make_gate(clock, record_path)
         await visit(gate)
         await visit(gate)
-        # Counted all the same, so the next tool call sees them.
         assert gate.status()["visits"]["last_hour"] == 2
+        assert clock.slept == [pytest.approx(4.5)]
+
+    async def test_outside_a_tool_call_a_spent_limit_refuses(self, clock, record_path):
+        """The CLI and a sign-in repair spend the same budget as a tool call."""
+        gate = make_gate(
+            clock,
+            record_path,
+            visits_per_hour=1,
+            pause_min_seconds=0,
+            pause_max_seconds=0,
+        )
+        await visit(gate)
+        with pytest.raises(PacingRefusedError) as refused:
+            await gate.before_visit(_PROFILE)
+        assert refused.value.kind == "limit"
+        assert gate.status()["visits"]["last_hour"] == 1
+
+    async def test_outside_a_tool_call_a_stop_refuses(self, clock, record_path):
+        """A stop holds for every process and every path, not only tool calls."""
+        gate = make_gate(clock, record_path)
+        gate.record_pushback("http_429")
+        with pytest.raises(PacingRefusedError) as refused:
+            await gate.before_visit(_PROFILE)
+        assert refused.value.kind == "stop"
+        assert gate.status()["visits"]["last_hour"] == 0
+
+    async def test_once_a_change_is_submitted_the_call_is_only_paced(
+        self, clock, record_path
+    ):
+        """Accepting an invitation counts toward no limit and still must be confirmed."""
+        gate = make_gate(clock, record_path)
+        with pacing.tool_call(deadline=None):
+            await visit(gate)
+            pacing.mark_write_submitted()
+            gate.record_pushback("http_429")
+            await gate.before_visit(_PROFILE)
         assert clock.slept == [pytest.approx(4.5)]
 
 
@@ -405,6 +475,32 @@ class TestStops:
         gate.record_pushback("http_429")
         assert gate.stop_seconds_left() == pytest.approx(900)
 
+    async def test_pushback_that_keeps_coming_backs_off_however_spaced(
+        self, clock, record_path
+    ):
+        """Each stop within a day of the one before doubles that one."""
+        gate = make_gate(clock, record_path)
+        lengths = []
+        for _ in range(4):
+            gate.record_pushback("http_429")
+            lengths.append(gate.stop_seconds_left())
+            clock.advance(12 * 3600)
+        assert lengths == [
+            pytest.approx(900),
+            pytest.approx(1800),
+            pytest.approx(3600),
+            pytest.approx(7200),
+        ]
+
+    async def test_linkedins_wait_is_capped_at_the_longest_stop(
+        self, clock, record_path
+    ):
+        gate = make_gate(clock, record_path)
+        gate.record_pushback("http_429", retry_after=10**9)
+        assert gate.stop_seconds_left() == pytest.approx(86400)
+        refusal = gate.refusal_for_new_call()
+        assert refusal is not None and refusal.retry_after == 86400
+
     async def test_a_burst_of_refusals_is_one_stop(self, clock, record_path):
         gate = make_gate(clock, record_path)
         for _ in range(5):
@@ -452,6 +548,44 @@ class TestStops:
         assert not gate.stop_active()
 
 
+class TestAClockSetBack:
+    """No limit outlasts what it reports, whatever the clock did."""
+
+    async def test_visits_counted_while_the_clock_ran_ahead_age_out_from_now(
+        self, clock, record_path
+    ):
+        gate = make_gate(
+            clock,
+            record_path,
+            visits_per_hour=2,
+            pause_min_seconds=0,
+            pause_max_seconds=0,
+        )
+        clock.now += 8 * 3600
+        await visit(gate)
+        await visit(gate)
+        clock.now -= 8 * 3600
+
+        refusal = gate.refusal_for_new_call()
+        assert refusal is not None and refusal.retry_after <= 3600
+        clock.advance(3601)
+        assert gate.refusal_for_new_call() is None
+
+    async def test_a_stop_set_while_the_clock_ran_ahead_ends_after_its_length(
+        self, clock, record_path
+    ):
+        gate = make_gate(clock, record_path)
+        clock.now += 3 * 86400
+        gate.record_pushback("http_429")
+        clock.now -= 3 * 86400
+
+        assert gate.stop_seconds_left() == pytest.approx(900)
+        refusal = gate.refusal_for_new_call()
+        assert refusal is not None and refusal.retry_after == 900
+        clock.advance(901)
+        assert not gate.stop_active()
+
+
 class TestRecord:
     async def test_it_survives_a_restart(self, clock, record_path):
         first = make_gate(clock, record_path)
@@ -480,13 +614,122 @@ class TestRecord:
         mine.refresh()
         assert mine.status()["visits"]["last_hour"] == 3
 
-    async def test_a_damaged_record_starts_fresh_with_a_stop(self, clock, record_path):
+    async def test_a_damaged_record_keeps_the_history_this_process_holds(
+        self, clock, record_path
+    ):
+        """The process holding the lease had the newest record in memory."""
+        gate = make_gate(clock, record_path, invites_per_day=2)
+        await visit(gate)
+        gate.record_write("invitation")
+        gate.record_write("invitation")
         record_path.write_text("{not json", encoding="utf-8")
-        gate = make_gate(clock, record_path)
+
         gate.refresh()
 
         assert gate.stop_seconds_left() == pytest.approx(900)
-        assert json.loads(record_path.read_text())["stop"]["reason"] == "damaged_record"
+        saved = json.loads(record_path.read_text())
+        assert saved["stop"]["reason"] == "damaged_record"
+        assert len(saved["invitations"]) == 2
+        clock.advance(901)
+        with pytest.raises(PacingRefusedError, match="2 connection invitations"):
+            gate.check_write("invitation")
+
+    async def test_a_damaged_record_with_no_history_stops_a_day_and_holds_invitations(
+        self, clock, record_path
+    ):
+        """Nothing to fall back on: every window it can no longer count is spent."""
+        record_path.write_text("", encoding="utf-8")
+        gate = make_gate(clock, record_path)
+
+        gate.refresh()
+
+        assert gate.stop_seconds_left() == pytest.approx(86400)
+        clock.advance(86401)
+        gate.check_write("message")
+        with pytest.raises(PacingRefusedError, match="damaged") as refused:
+            gate.check_write("invitation")
+        assert refused.value.retry_after == pytest.approx(6 * 86400, abs=2)
+        assert "held_until" in gate.status()["invitations"]
+        # The hold is part of the record, so a restart keeps it.
+        restarted = make_gate(clock, record_path)
+        restarted.refresh()
+        with pytest.raises(PacingRefusedError, match="damaged"):
+            restarted.check_write("invitation")
+
+    async def test_a_record_from_a_newer_server_is_left_alone(self, clock, record_path):
+        newer = json.dumps({"version": 2, "visits": [], "anything": "else"})
+        record_path.write_text(newer, encoding="utf-8")
+        gate = make_gate(clock, record_path)
+
+        gate.refresh()
+        gate.record_loads(1)
+
+        assert gate.stop_active()
+        assert gate.status()["stop"]["reason"] == "newer_record"
+        with pytest.raises(PacingRefusedError, match="newer version"):
+            await gate.before_visit(_PROFILE)
+        assert record_path.read_text(encoding="utf-8") == newer
+
+    async def test_reading_the_status_never_writes_the_record(
+        self, clock, record_path, monkeypatch
+    ):
+        """get_session_status runs without the lease; only the lease holder repairs.
+
+        Through the gate the process builds for itself on first use, which is
+        what get_session_status meets in a process that has served no call.
+        """
+        record_path.write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr(pacing, "_gate", None)
+
+        status = pacing.status_on_disk()
+
+        assert "unreadable" in status["record"]
+        assert record_path.read_text(encoding="utf-8") == "{not json"
+
+    async def test_an_idle_process_never_writes_an_old_copy_over_a_newer_one(
+        self, clock, record_path
+    ):
+        """A frontend's gate built days ago reads the owner's record before saving."""
+        idle = make_gate(clock, record_path)
+        idle.refresh()
+        busy = make_gate(clock, record_path)
+        for _ in range(3):
+            await visit(busy)
+
+        idle.record_loads(1)
+
+        saved = json.loads(record_path.read_text())
+        assert len(saved["visits"]) == 3
+        assert len(saved["loads"]) == 1
+
+    async def test_a_failed_save_is_tried_again_with_the_next_change(
+        self, clock, record_path, monkeypatch
+    ):
+        from linkedin_mcp_server import common_utils
+
+        gate = make_gate(clock, record_path)
+        await visit(gate)
+        real_write = common_utils.secure_write_text
+        failures = iter([OSError("disk busy")])
+
+        def flaky_write(path, text, *args, **kwargs):
+            failure = next(failures, None)
+            if failure is not None:
+                raise failure
+            return real_write(path, text, *args, **kwargs)
+
+        monkeypatch.setattr(common_utils, "secure_write_text", flaky_write)
+        gate.record_pushback("http_429")
+        assert json.loads(record_path.read_text())["stop"] is None
+
+        # Another process writes the file meanwhile. The stop this one could
+        # not save is newer than that, so it is not read over: it is written.
+        other = make_gate(clock, record_path)
+        other.refresh()
+        other.record_loads(1)
+        gate.refresh()
+        assert gate.stop_active()
+        assert json.loads(record_path.read_text())["stop"]["reason"] == "http_429"
 
     async def test_a_missing_record_keeps_what_this_process_knows(
         self, clock, record_path
@@ -618,7 +861,7 @@ class TestDisabled:
         assert gate.loads_allowed(50) == 50
         assert gate.conversation_opens_allowed(None) is None
         assert gate.load_pause(0.5) == 0.5
-        assert gate.conversation_pause_range() == (0.0, 0.0)
+        assert gate.conversation_pause() == 0.0
         assert gate.status() == {"enabled": False}
 
 
@@ -1185,6 +1428,62 @@ class TestWritesInTheTools:
             has_labeled_action_anchor=False,
             has_incoming_action_row=False,
         )
+
+    async def test_an_accepted_invitation_is_confirmed_whatever_stops_after_it(
+        self, mock_page, clock, record_path
+    ):
+        """Accepting cannot be undone, so the read that confirms it is never refused.
+
+        LinkedIn answers the accept itself with a 429 here, which starts a stop.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from linkedin_mcp_server.linkedin.connection import ActionSignals
+        from linkedin_mcp_server.linkedin.connection_actions import ConnectionActions
+        from linkedin_mcp_server.linkedin.navigation import PageNavigator
+        from linkedin_mcp_server.linkedin.session import PageSession
+
+        gate = make_gate(clock, record_path)
+        pacing.install_gate(gate)
+        texts = iter(["Jane\n\n· 2nd\n\nAccept\nIgnore\n", "Jane\n\n· 1st\n"])
+
+        async def read_main_profile(username, *args, **kwargs):
+            # The real read is a page visit like any other.
+            await pacing.gate().before_visit(f"https://www.linkedin.com/in/{username}/")
+            pacing.gate().after_visit()
+            return {"url": "u", "sections": {"main_profile": next(texts)}}
+
+        def signals(incoming: bool) -> ActionSignals:
+            return ActionSignals(
+                has_invite_anchor=False,
+                has_compose_anchor_in_action_root=not incoming,
+                has_edit_intro_anchor=False,
+                has_labeled_action_button=False,
+                has_labeled_action_anchor=False,
+                has_incoming_action_row=incoming,
+            )
+
+        async def accept() -> bool:
+            gate.record_pushback("http_429")
+            return True
+
+        session = PageSession(mock_page)
+        actions = ConnectionActions(session, PageNavigator(session), read_main_profile)
+        with (
+            patch.object(
+                actions,
+                "_read_action_signals",
+                AsyncMock(side_effect=[signals(True), signals(False)]),
+            ),
+            patch.object(
+                actions, "_click_incoming_accept", AsyncMock(side_effect=accept)
+            ),
+            pacing.tool_call(deadline=None),
+        ):
+            result = await actions.connect_with_person("jane")
+
+        assert result["status"] == "accepted"
+        assert gate.stop_active()
 
     async def test_an_invitation_over_the_limit_never_opens_the_invite_page(
         self, mock_page, clock, record_path

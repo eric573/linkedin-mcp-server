@@ -8,27 +8,32 @@ the account does, not which tool asked. The decision is recorded in
 ``docs/decisions/2026-10-30-pace-every-linkedin-request.md``.
 
 Weights. A page visit costs one unit, and so does opening a conversation,
-which loads a thread the way a page does. A scroll or "Show more" click that
-loads more items costs a fifth, the five-scrolls-to-a-page the content search
-already uses. Scrolling through a page that is already loaded costs nothing:
-it is part of the visit.
+which loads a thread the way a page does. A scroll that grows the page (a
+profile's lazy sections, an endless list, the job rail) or a "Show more" click
+costs a fifth, the five-scrolls-to-a-page the content search already uses.
+The scroll that finds the page complete costs nothing. Each load asks first
+and is counted as it happens, never after its loop, and the next page visit
+waits its pause after the last thing that loaded.
 
 Stops. When LinkedIn pushes back -- an HTTP 429 or 999, a rate-limit page, a
 page that comes back empty even when retried, a checkpoint -- every request
 stops for a while, for every tool and every process that shares the session.
 
-Waiting versus refusing. Inside a tool call, a short wait is waited out and a
-long one refuses, so the client is told when to come back rather than having a
-call held open. Outside a tool call (the CLI) nothing is refused, only paced.
-After an invitation or message has been submitted, the rest of that call is
-paced but never refused: refusing the read that confirms it would hide whether
-it went out.
+Waiting versus refusing. A short wait is waited out and a long one refuses, so
+the client is told when to come back rather than having a call held open, and
+a stop refuses everything, inside a tool call or outside one (the CLI, a
+sign-in repair). After a change has been submitted (an invitation, a message,
+an accepted invitation) the rest of that call is paced but never refused:
+refusing the read that confirms it would hide whether it went out.
 
 The record. What happened is kept as timestamps in ``rate-limit.json`` beside
 the saved session, never as remaining counts, so a changed limit applies to
 the history at once. It is written while the profile lease is held, which
 every browser call holds, and atomically, so a reader without the lease always
-sees a whole version.
+sees a whole version. It is read again before every change, so a process that
+has been idle never writes an old copy over a newer one. A timestamp a clock
+set back left in the future is pulled back to now, so no limit outlasts what
+it reports.
 """
 
 from __future__ import annotations
@@ -90,8 +95,12 @@ PushbackKind = Literal[
     "challenge",
     "restricted",
     "damaged_record",
+    "newer_record",
 ]
 WriteKind = Literal["invitation", "message"]
+#: Why a request is refused: LinkedIn pushed back, a limit is spent, or the
+#: tool call has no time left for the wait.
+RefusalKind = Literal["stop", "limit", "time"]
 
 #: Routes where LinkedIn challenges the session rather than signing it out.
 #: Matched by path, never by page text, so they hold in every language.
@@ -106,15 +115,26 @@ _PUSHBACK_TEXT: dict[str, str] = {
     "challenge": "LinkedIn showed a security checkpoint during a tool call",
     "restricted": "LinkedIn restricted the account",
     "damaged_record": "the rate limit record could not be read",
+    "newer_record": (
+        "the rate limit record was written by a newer version of this server, "
+        "which this one cannot read; update it, or stop the newer one and "
+        "delete rate-limit.json"
+    ),
 }
 
 
 class PacingRefusedError(RateLimitError):
-    """The server will not ask LinkedIn for anything more right now."""
+    """The server will not ask LinkedIn for anything more right now.
 
-    def __init__(self, message: str, retry_after: int):
+    ``kind`` says why. A ``time`` refusal is the tool call running out of time
+    for a wait, not LinkedIn or a limit, and a reader that budgets its own time
+    reports it as such.
+    """
+
+    def __init__(self, message: str, retry_after: int, *, kind: RefusalKind = "limit"):
         super().__init__(message, suggested_wait_time=retry_after)
         self.retry_after = retry_after
+        self.kind: RefusalKind = kind
 
 
 async def _sleep(seconds: float) -> None:
@@ -137,6 +157,8 @@ class _CallScope:
 
     deadline: float | None
     write_submitted: bool = False
+    #: In-page loads the gate held back during the call.
+    loads_held_back: int = 0
 
 
 _scope: ContextVar[_CallScope | None] = ContextVar("pacing_call_scope", default=None)
@@ -161,6 +183,33 @@ def in_tool_call() -> bool:
     return _scope.get() is not None
 
 
+def loads_held_back() -> int:
+    """How many in-page loads the gate has held back during the running call.
+
+    A reader compares this before and after a section to learn that the
+    section was cut short, which it then says, rather than return a shorter
+    list that reads as complete.
+    """
+    scope = _scope.get()
+    return 0 if scope is None else scope.loads_held_back
+
+
+def cut_short_retry_after() -> int:
+    """Whole seconds until the gate allows what it held back."""
+    return _whole_seconds(gate().seconds_until_next_visit())
+
+
+def mark_write_submitted() -> None:
+    """Note that the running call has made a change it still has to confirm.
+
+    For a change no limit counts, such as accepting an invitation: the rest
+    of the call is paced but never refused, as after a counted write.
+    """
+    scope = _scope.get()
+    if scope is not None:
+        scope.write_submitted = True
+
+
 @dataclass
 class _Record:
     """Everything the gate remembers, as it is written to disk."""
@@ -174,7 +223,23 @@ class _Record:
     pause_until: float = 0.0
     stop_until: float = 0.0
     stop_reason: str | None = None
+    #: How long the latest stop was set to last, which the next one doubles.
+    stop_length: float = 0.0
     stops_started: list[float] = field(default_factory=list)
+    #: No invitation before this, after a record whose week was lost.
+    invitations_held_until: float = 0.0
+
+    def has_history(self) -> bool:
+        return any(
+            (
+                self.visits,
+                self.conversation_opens,
+                self.loads,
+                self.invitations,
+                self.messages,
+                self.stops_started,
+            )
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -187,11 +252,16 @@ class _Record:
             "people_search_pages": self.people_search_pages,
             "pause_until": self.pause_until,
             "stop": (
-                {"until": self.stop_until, "reason": self.stop_reason}
+                {
+                    "until": self.stop_until,
+                    "reason": self.stop_reason,
+                    "length": self.stop_length,
+                }
                 if self.stop_until
                 else None
             ),
             "stops_started": self.stops_started,
+            "invitations_held_until": self.invitations_held_until,
         }
 
     @classmethod
@@ -220,8 +290,22 @@ class _Record:
             pause_until=_number(raw.get("pause_until", 0.0)),
             stop_until=_number(stop.get("until", 0.0)) if stop else 0.0,
             stop_reason=reason,
+            stop_length=_number(stop.get("length", 0.0)) if stop else 0.0,
             stops_started=_stamps(raw, "stops_started"),
+            invitations_held_until=_number(raw.get("invitations_held_until", 0.0)),
         )
+
+
+def _is_newer(raw: object) -> bool:
+    """Whether *raw* is a record of a later format than this server writes."""
+    if not isinstance(raw, dict):
+        return False
+    version = raw.get("version")
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version > _RECORD_VERSION
+    )
 
 
 def _is_count(value: object) -> bool:
@@ -266,6 +350,10 @@ class Pacing:
         self._seen: tuple[int, int] | None = None
         self._owned: bool | None = None
         self._warned = False
+        #: The record holds a change a save failed to write.
+        self._dirty = False
+        #: The file belongs to a newer server: never written over.
+        self._read_only = False
         #: Every second spent waiting before a visit, so a caller timing its
         #: own pages can take the waits back out.
         self.waited_seconds = 0.0
@@ -284,33 +372,79 @@ class Pacing:
     def refresh(self) -> None:
         """Adopt the record on disk, which another process may have written.
 
-        Called with the profile lease held. A missing file keeps what this
-        process knows: it is written again with the next change. A file that
-        does not parse is replaced by a fresh record that starts with a stop,
-        so damage can never quietly hand out a new budget.
+        Called with the profile lease held, and before every change, so an
+        idle process never writes an old copy over a newer one. A missing
+        file keeps what this process knows: it is written again with the next
+        change, as is a change an earlier save failed to write, which is newer
+        than the file. A file that does not parse never hands out a new
+        budget: this process keeps the history it holds and stops for a
+        while, and one with no history stops for a day and holds invitations
+        for a week, the windows it can no longer count. A file from a newer
+        version of the server is left alone, and this one sends nothing.
         """
         if not self.enabled or self._path is None:
             return
+        if self._dirty:
+            self._save()
+            if self._dirty:
+                return
         seen = self._stat()
         if seen is None or seen == self._seen:
             return
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
-            self._record = _Record.from_json(raw)
+            if _is_newer(raw):
+                self._stand_back(seen)
+                return
+            record = _Record.from_json(raw)
         except (OSError, ValueError, TypeError) as exc:
+            self._repair(exc)
+            return
+        self._record = record
+        self._read_only = False
+        self._seen = seen
+
+    def _repair(self, exc: Exception) -> None:
+        """Replace a record that does not parse, without handing out budget."""
+        assert self._path is not None
+        self._read_only = False
+        if self._seen is not None or self._record.has_history():
             logger.warning(
-                "The rate limit record %s could not be read (%s); starting a "
-                "fresh one that begins with a stop",
+                "The rate limit record %s could not be read (%s); keeping the "
+                "history this process holds and starting a stop",
+                self._path,
+                exc,
+            )
+            self.record_pushback("damaged_record")
+        else:
+            logger.warning(
+                "The rate limit record %s could not be read (%s), and this "
+                "process has no history of its own: stopping for a day and "
+                "holding invitations for a week. If the account has been "
+                "quiet, stop the server and delete the file to start afresh.",
                 self._path,
                 exc,
             )
             self._record = _Record()
-            self.record_pushback("damaged_record")
-            # Written even when stops are switched off, or every later call
-            # would read the damaged file again and warn again.
-            self._save()
-            return
+            self.record_pushback("damaged_record", retry_after=_DAY)
+            self._record.invitations_held_until = self._clock.wall() + _WEEK
+        # Written even when stops are switched off, or every later call
+        # would read the damaged file again and warn again.
+        self._save()
+
+    def _stand_back(self, seen: tuple[int, int]) -> None:
+        """A newer server's record: read nothing from it, write nothing over it."""
+        if not self._read_only:
+            logger.warning(
+                "The rate limit record %s was written by a newer version of "
+                "this server. This one sends LinkedIn nothing and leaves the "
+                "file alone until it is updated.",
+                self._path,
+            )
+        self._read_only = True
         self._seen = seen
+        self._record = _Record()
+        self.record_pushback("newer_record", retry_after=self._longest_stop())
 
     def _stat(self) -> tuple[int, int] | None:
         assert self._path is not None
@@ -325,7 +459,7 @@ class Pacing:
         return (info.st_mtime_ns, info.st_size)
 
     def _save(self) -> None:
-        if self._path is None:
+        if self._path is None or self._read_only:
             return
         from linkedin_mcp_server.common_utils import secure_write_text
 
@@ -336,15 +470,21 @@ class Pacing:
                 json.dumps(self._record.to_json(), indent=1, sort_keys=True) + "\n",
             )
             self._seen = self._stat()
+            self._dirty = False
         except Exception as exc:
-            if not self._warned:
+            # Tried again before the next change, and before any file is read
+            # over it: what this process holds is the newer record.
+            self._dirty = True
+            stopping = self._record.stop_until > self._clock.wall()
+            if stopping or not self._warned:
                 self._warned = True
                 logger.warning(
                     "Could not save the rate limit record to %s (%s). The limits "
-                    "still apply in this process, but a restart will not "
-                    "remember them.",
+                    "still apply in this process%s, and the save is tried again "
+                    "with the next change.",
                     self._path,
                     exc,
+                    ", including the stop it holds" if stopping else "",
                 )
 
     def _require_owned_root(self) -> None:
@@ -384,8 +524,49 @@ class Pacing:
 
     def _now(self) -> float:
         now = self._clock.wall()
+        self._normalize(now)
         self._prune(now)
         return now
+
+    def _normalize(self, now: float) -> None:
+        """Pull back what a clock set back left in the future.
+
+        Every timestamp is when something happened, so none is later than now;
+        one that is would count against its window for as long as the clock
+        was off, past every wait the gate reports. A stop keeps its own length
+        from now, and a pause its longest.
+        """
+        record = self._record
+        changed = False
+        for name in (
+            "visits",
+            "conversation_opens",
+            "loads",
+            "invitations",
+            "messages",
+            "stops_started",
+        ):
+            stamps: list[float] = getattr(record, name)
+            if any(stamp > now for stamp in stamps):
+                setattr(record, name, [min(stamp, now) for stamp in stamps])
+                changed = True
+        stop_cap = now + (
+            record.stop_length if record.stop_length > 0 else self._longest_stop()
+        )
+        if record.stop_until > stop_cap:
+            record.stop_until = stop_cap
+            changed = True
+        pause_cap = now + self._longest_pause()
+        if record.pause_until > pause_cap:
+            record.pause_until = pause_cap
+            changed = True
+        if record.invitations_held_until > now + _WEEK:
+            record.invitations_held_until = now + _WEEK
+            changed = True
+        if changed:
+            # Written with the next change, not here: reading the gate is
+            # not a reason to write the record.
+            self._dirty = True
 
     # -- what has been spent -----------------------------------------------
 
@@ -445,22 +626,28 @@ class Pacing:
         return max(0.0, room)
 
     def _stop_left(self, now: float) -> float:
-        left = self._record.stop_until - now
-        if left <= 0:
-            return 0.0
-        # A clock set back would otherwise stretch the stop by the difference.
-        return min(left, max(_MAX_DOUBLED_STOP_SECONDS, self._longest_stop()))
+        # Bounded by `_normalize`, so this is when the stop really ends.
+        return max(0.0, self._record.stop_until - now)
 
     def _longest_stop(self) -> float:
+        """The longest any stop may run, LinkedIn's Retry-After included."""
         assert self._settings is not None
-        return self._settings.challenge_stop_hours * 3600
+        return max(
+            _MAX_DOUBLED_STOP_SECONDS, self._settings.challenge_stop_hours * 3600
+        )
+
+    def _longest_pause(self) -> float:
+        assert self._settings is not None
+        return max(
+            self._settings.pause_max_seconds,
+            _LOAD_PAUSE_FLOOR_SECONDS * _LOAD_PAUSE_JITTER[1],
+        )
 
     def _pause_left(self, now: float) -> float:
-        assert self._settings is not None
         left = self._record.pause_until - now
         if left <= 0:
             return 0.0
-        return min(left, self._settings.pause_max_seconds)
+        return min(left, self._longest_pause())
 
     def _search_block(self, now: float, url: str) -> tuple[float, str] | None:
         assert self._settings is not None
@@ -489,6 +676,7 @@ class Pacing:
             f"Rate limit stop: {reason}, so the server is not sending LinkedIn "
             f"anything until {until} (in {_duration(left)}). Try again then.",
             _whole_seconds(left),
+            kind="stop",
         )
 
     # -- page visits -------------------------------------------------------
@@ -500,15 +688,17 @@ class Pacing:
         the tool call's own.
 
         Raises:
-            PacingRefusedError: Inside a tool call, when LinkedIn asked for a
-                stop, a limit is used up for longer than a call should wait,
-                or the call has no time left for the wait and the page.
+            PacingRefusedError: When LinkedIn asked for a stop, a limit is used
+                up for longer than a call should wait, or the call has no time
+                left for the wait and the page. Inside a tool call or outside
+                one alike, except once the call has submitted a change.
         """
         if not self.enabled:
             return
+        self.refresh()
         now = self._now()
         scope = _scope.get()
-        enforced = scope is not None and not scope.write_submitted
+        enforced = scope is None or not scope.write_submitted
         pause = self._pause_left(now)
         blocks = [
             block
@@ -518,7 +708,7 @@ class Pacing:
             )
             if block is not None
         ]
-        if scope is not None and enforced:
+        if enforced:
             if self._stop_left(now) > 0:
                 raise self._stop_error(now)
             longest = max(blocks, key=lambda item: item[0]) if blocks else None
@@ -529,7 +719,7 @@ class Pacing:
                     _whole_seconds(longest[0]),
                 )
             wait = max(pause, longest[0] if longest else 0.0)
-            limit = _earliest(scope.deadline, deadline)
+            limit = _earliest(scope.deadline if scope else None, deadline)
             if (
                 wait > 0
                 and limit is not None
@@ -539,9 +729,10 @@ class Pacing:
                     "Rate limit: this call has no time left to wait "
                     f"{_duration(wait)} for its next page. Call again to continue.",
                     _whole_seconds(wait),
+                    kind="time",
                 )
         else:
-            # Outside a tool call, or once a write went out: paced, never refused.
+            # Once a change went out: paced, never refused.
             wait = pause
         # Milliseconds are as fine as a pause needs to be, and keeping the float
         # noise of the subtraction out keeps the logs and traces readable.
@@ -567,6 +758,7 @@ class Pacing:
         if not self.enabled:
             return
         assert self._settings is not None
+        self.refresh()
         now = self._now()
         self._record.pause_until = now + self._rng.uniform(
             self._settings.pause_min_seconds, self._settings.pause_max_seconds
@@ -604,23 +796,40 @@ class Pacing:
     # -- loads inside a page -----------------------------------------------
 
     def loads_allowed(self, wanted: int) -> int:
-        """How many of *wanted* scrolls or "Show more" clicks may load now."""
+        """How many of *wanted* scrolls or "Show more" clicks may load now.
+
+        Fewer than *wanted* is noted on the running call, see
+        :func:`loads_held_back`.
+        """
         if not self.enabled or wanted <= 0:
             return max(0, wanted)
         now = self._now()
         if self._stop_left(now) > 0:
-            return 0
-        room = self._room(now)
-        if math.isinf(room):
-            return wanted
-        return max(0, min(wanted, math.floor(room / LOAD_WEIGHT + _EPSILON)))
+            allowed = 0
+        else:
+            room = self._room(now)
+            allowed = (
+                wanted
+                if math.isinf(room)
+                else max(0, min(wanted, math.floor(room / LOAD_WEIGHT + _EPSILON)))
+            )
+        scope = _scope.get()
+        if scope is not None and allowed < wanted:
+            scope.loads_held_back += wanted - allowed
+        return allowed
 
     def record_loads(self, count: int) -> None:
-        """Count *count* scrolls or clicks that loaded, or tried to load, more."""
+        """Count *count* scrolls or clicks that loaded, or tried to load, more.
+
+        The next page visit then waits a load's pause after this one, rather
+        than only the pause after the page the load was made on.
+        """
         if not self.enabled or count <= 0:
             return
+        self.refresh()
         now = self._now()
         self._record.loads.extend([now] * count)
+        self._pause_until_at_least(now + self.load_pause(0.0))
         self._save()
 
     def load_pause(self, seconds: float) -> float:
@@ -669,6 +878,7 @@ class Pacing:
             "Rate limit: this call has no time left to open a conversation. "
             "Call again to continue.",
             _whole_seconds(self._pause_left(now)),
+            kind="time",
         )
 
     def seconds_until_next_visit(self) -> float:
@@ -681,17 +891,36 @@ class Pacing:
             self._stop_left(now), self._pause_left(now), block[0] if block else 0.0
         )
 
-    def conversation_pause_range(self) -> tuple[float, float]:
-        """Seconds to wait before each conversation is opened, low and high."""
-        return CONVERSATION_PAUSE_SECONDS if self.enabled else (0.0, 0.0)
+    def conversation_pause(self) -> float:
+        """Seconds to wait before opening the next conversation, drawn at random
+        so the clicks keep no fixed rhythm."""
+        if not self.enabled:
+            return 0.0
+        return self._rng.uniform(*CONVERSATION_PAUSE_SECONDS)
 
     def record_conversation_opens(self, count: int) -> None:
-        """Count *count* conversations opened, or clicked open."""
+        """Count *count* conversations opened, or clicked open.
+
+        A thread loads like a page, so the next page visit waits a full pause
+        after it, as it would after a page.
+        """
         if not self.enabled or count <= 0:
             return
+        assert self._settings is not None
+        self.refresh()
         now = self._now()
         self._record.conversation_opens.extend([now] * count)
+        self._pause_until_at_least(
+            now
+            + self._rng.uniform(
+                self._settings.pause_min_seconds, self._settings.pause_max_seconds
+            )
+        )
         self._save()
+
+    def _pause_until_at_least(self, until: float) -> None:
+        if until > self._record.pause_until:
+            self._record.pause_until = until
 
     # -- writes ------------------------------------------------------------
 
@@ -704,9 +933,21 @@ class Pacing:
         if not self.enabled:
             return
         assert self._settings is not None
+        self.refresh()
         now = self._now()
         if self._stop_left(now) > 0:
             raise self._stop_error(now)
+        held = self._record.invitations_held_until - now
+        if kind == "invitation" and held > 0:
+            until = datetime.fromtimestamp(now + held, UTC).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+            raise PacingRefusedError(
+                "Rate limit: invitations are held until "
+                f"{until}, because the rate limit record was damaged and this "
+                "week's invitations could not be counted.",
+                _whole_seconds(held),
+            )
         settings = self._settings
         if kind == "invitation":
             stamps = self._record.invitations
@@ -739,11 +980,10 @@ class Pacing:
         From here on the call is never refused, only paced: the read that
         confirms the write is the only way to learn whether it went out.
         """
-        scope = _scope.get()
-        if scope is not None:
-            scope.write_submitted = True
+        mark_write_submitted()
         if not self.enabled:
             return
+        self.refresh()
         now = self._now()
         if kind == "invitation":
             self._record.invitations.append(now)
@@ -758,16 +998,23 @@ class Pacing:
     ) -> None:
         """Stop every LinkedIn request for a while, because LinkedIn asked.
 
-        Each stop that starts within a day of another lasts twice as long as
-        the one before. Signals that arrive while a stop runs extend it rather
-        than counting as a repeat, so one burst of refusals is one stop.
+        Each stop that starts within a day of the one before lasts twice as
+        long as that one, so pushback that keeps coming backs off further
+        however far apart it is spaced. Signals that arrive while a stop runs
+        extend it by its own length rather than counting as a repeat, so one
+        burst of refusals is one stop. LinkedIn's ``Retry-After`` wins when it
+        asks for longer, up to the longest stop there is.
         """
         if not self.enabled:
             return
         assert self._settings is not None
         settings = self._settings
+        # Both of these are recorded by `refresh` itself.
+        if kind not in ("damaged_record", "newer_record"):
+            self.refresh()
         now = self._now()
         active = self._stop_left(now) > 0
+        record = self._record
         if kind in ("challenge", "restricted"):
             length = settings.challenge_stop_hours * 3600
         else:
@@ -776,19 +1023,25 @@ class Pacing:
                 if kind == "empty_page"
                 else settings.stop_minutes
             ) * 60
-            # The stops that came before this one. A running stop is the latest
-            # entry, and a signal arriving inside it is part of it, not a repeat.
-            earlier = len(self._record.stops_started) - (1 if active else 0)
-            repeats = 0 if kind == "damaged_record" else max(0, earlier)
-            length = min(base * 2**repeats, max(base, _MAX_DOUBLED_STOP_SECONDS))
+            doubled = max(base, _MAX_DOUBLED_STOP_SECONDS)
+            if base <= 0 or kind in ("damaged_record", "newer_record"):
+                length = base
+            elif active:
+                length = min(max(base, record.stop_length), doubled)
+            elif record.stops_started:
+                # `stops_started` keeps a day, so the one before is recent.
+                length = min(max(base, 2 * record.stop_length), doubled)
+            else:
+                length = base
             if retry_after is not None and length > 0:
-                length = max(length, retry_after)
+                length = max(length, min(retry_after, self._longest_stop()))
         if length <= 0:
             return
         until = now + length
-        if until > self._record.stop_until:
-            self._record.stop_until = until
-            self._record.stop_reason = kind
+        if until > record.stop_until:
+            record.stop_until = until
+            record.stop_reason = kind
+            record.stop_length = length
         if not active:
             self._record.stops_started.append(now)
             logger.warning(
@@ -797,6 +1050,13 @@ class Pacing:
                 _duration(self._stop_left(now)),
             )
         self._save()
+
+    def stop_refusal(self) -> PacingRefusedError | None:
+        """What a running stop refuses with, or None when none runs."""
+        if not self.enabled:
+            return None
+        now = self._now()
+        return self._stop_error(now) if self._stop_left(now) > 0 else None
 
     def stop_active(self) -> bool:
         """Whether every LinkedIn request is stopped right now."""
@@ -835,6 +1095,15 @@ class Pacing:
                 "per_24_hours": settings.invites_per_day,
                 "last_7_days": within(record.invitations, _WEEK),
                 "per_7_days": settings.invites_per_week,
+                **(
+                    {
+                        "held_until": datetime.fromtimestamp(
+                            record.invitations_held_until, UTC
+                        ).isoformat()
+                    }
+                    if record.invitations_held_until > now
+                    else {}
+                ),
             },
             "messages": {
                 "last_24_hours": within(record.messages, _DAY),
@@ -883,6 +1152,8 @@ def status_on_disk() -> dict[str, Any]:
         }
     view = copy.copy(current)
     view._record = record
+    # A view never writes, whatever it finds to correct.
+    view._read_only = True
     return view.status()
 
 
@@ -958,9 +1229,10 @@ def _build_gate() -> Pacing:
             exc_info=True,
         )
         path = None
-    built = Pacing(settings, path)
-    built.refresh()
-    return built
+    # Not refreshed here: reading the record may repair it, which writes, and
+    # this can run without the lease (get_session_status). Every change
+    # refreshes first, and the middleware refreshes under the lease.
+    return Pacing(settings, path)
 
 
 def install_gate(replacement: Pacing) -> None:

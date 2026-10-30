@@ -92,7 +92,7 @@
       "call": "search_posts",
       "kind": "boundary.scroll_body",
       "max_scrolls": 10,
-      "pause_time": 1.25
+      "pause_time": 0.5
     },
     {
       "arg": {

@@ -1057,13 +1057,20 @@ async def _conversation_scenario(method: str) -> dict[str, Any]:
     )
 
 
-ROW_CLICK_STOPPED_OUTCOME = {
-    "rows": [
-        {"ariaLabel": "Select conversation with Ada Lovelace", "threadId": "2-ada"}
-    ],
-    "stoppedAt": {"ariaLabel": "Select conversation with Bob Stall", "position": 1},
-    "firstIndexGap": None,
+ROW_CLICK_STOPPED_LISTING = {
     "startThreadId": None,
+    "rows": [
+        {
+            "ariaLabel": "Select conversation with Ada Lovelace",
+            "matches": True,
+            "clickable": True,
+        },
+        {
+            "ariaLabel": "Select conversation with Bob Stall",
+            "matches": True,
+            "clickable": True,
+        },
+    ],
 }
 
 
@@ -1080,7 +1087,11 @@ async def _conversation_row_resolution_scenario() -> dict[str, Any]:
     page.script("evaluate:scroll_main_region", True, True)
     page.script("evaluate:root_content", _root("Conversation content"))
     page.script("wait_for_selector:conversation_rows", None)
-    page.script("evaluate:conversation_thread_refs", ROW_CLICK_STOPPED_OUTCOME)
+    page.script("evaluate:conversation_row_list", ROW_CLICK_STOPPED_LISTING)
+    # Ada's click opens her thread; Bob's opens nothing within the poll budget.
+    page.script(
+        "evaluate:conversation_row_click", {"threadId": "2-ada"}, {"threadId": None}
+    )
     extractor = _extractor(page)
     async with boundaries(recorder, clock):
         with recorder.context("get_inbox", "conversation"):

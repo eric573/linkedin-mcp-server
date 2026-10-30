@@ -57,7 +57,7 @@ LinkedIn is used in many languages, so never tell connection state, buttons or a
 
 ### Pace every request
 
-Every page the server opens asks the pacing gate first, so one budget covers the whole account. Navigate through `PageNavigator._navigate_to_page`, which asks it already; a navigation anywhere else fails `tests/test_pacing.py`. A loop that makes LinkedIn send more inside a page, such as a scroll that loads the next batch or a click that opens a thread, asks `pacing.gate()` how many it may make and counts the ones it made. [Pace every LinkedIn request](../docs/decisions/2026-10-30-pace-every-linkedin-request.md) explains why.
+Every page the server opens asks the pacing gate first, so one budget covers the whole account. Navigate through `PageNavigator._navigate_to_page`, which asks it already; a navigation anywhere else fails `tests/test_pacing.py`. A loop that makes LinkedIn send more inside a page, such as a scroll that loads the next batch or a click that opens a thread, asks `pacing.gate()` before each one and counts it as it is made, so a stop ends the loop and a cancelled call has counted what it sent. A reader whose section the gate cut short reports it with a `rate_limit` section error beside the text (`pacing.loads_held_back`). [Pace every LinkedIn request](../docs/decisions/2026-10-30-pace-every-linkedin-request.md) explains why.
 
 ### Return format
 

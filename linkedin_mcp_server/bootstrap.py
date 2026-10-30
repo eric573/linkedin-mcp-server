@@ -4287,6 +4287,7 @@ async def _start_login_if_needed(
         AccountRestrictedError,
         OffLinkedInLandingError,
         ProxyConnectionError,
+        RateLimitError,
     )
 
     # Cheap check-and-claim under the lock; the slow work (auto-import browser
@@ -4343,6 +4344,14 @@ async def _start_login_if_needed(
             # The import itself re-raises these rather than reporting "no
             # session"; swallowing them here would undo that and send the user
             # into a manual login that has to go through the same network.
+            raise
+        except RateLimitError:
+            # LinkedIn or the server's own rate limit refused the import's
+            # check, which says nothing about the session in the browser. A
+            # login window would only go through the same stop, so the call
+            # reports the rate limit, and the import is tried again after it.
+            async with _lock:
+                _state.import_attempted = False
             raise
         except AccountRestrictedError:
             # For the same reason: the manual login would land on the page the
@@ -4658,6 +4667,18 @@ async def invalidate_auth_and_trigger_relogin(
             progress=25,
             total=100,
             message="LinkedIn login browser opened",
+        )
+    # A checkpoint met during the call that ended here also stopped tool calls
+    # for a day. Signing in is never stopped, but a retry right after it is
+    # refused, so the message says when one goes through instead of now.
+    from linkedin_mcp_server.core import pacing
+
+    stop = pacing.gate().stop_refusal()
+    if stop is not None:
+        raise AuthenticationStartedError(
+            "LinkedIn wants you to sign in again. A login browser window has "
+            "been opened: sign in there with your LinkedIn credentials. Tool "
+            f"calls wait for the rate limit as well. {stop}"
         )
     raise AuthenticationStartedError(
         "Session expired. A login browser window has been opened. "

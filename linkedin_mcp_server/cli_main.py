@@ -16,6 +16,7 @@ from linkedin_mcp_server.bootstrap import (
     ensure_browser_installed,
 )
 from linkedin_mcp_server.core import AccountRestrictedError, AuthenticationError
+from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.exceptions import (
     BrowserBusyError,
     BrowserDowngradeError,
@@ -608,11 +609,17 @@ def profile_info_and_exit() -> None:
             return browser.is_authenticated
         except AuthenticationError:
             return False
-        except (BrowserDowngradeError, AccountRestrictedError, BrowserBusyError):
+        except (
+            BrowserDowngradeError,
+            AccountRestrictedError,
+            BrowserBusyError,
+            PacingRefusedError,
+        ):
             # Not "unexpected", and no traceback. This is the guard doing its
             # job, the message already says what happened and what to do, and
             # `--status` is the first thing a puzzled user runs. The tool path
-            # treats the first two the same way, in `error_handler`.
+            # treats the first two the same way, in `error_handler`. The rate
+            # limit holds here too: checking the session is a page visit.
             raise
         except Exception as e:
             logger.exception(f"Unexpected error checking session: {e}")
@@ -640,6 +647,10 @@ def profile_info_and_exit() -> None:
         # Ahead of the generic handler, which would add "Check logs and browser
         # configuration" to a message that already names the fix exactly.
         print(f"\n❌ {e}")
+        sys.exit(1)
+    except PacingRefusedError as e:
+        # The session was not checked, so neither valid nor invalid is true.
+        print(f"\n⏸️  Session not checked: {e}")
         sys.exit(1)
     except BrowserBusyError:
         # The tool wording ("call this exact tool again") is for an MCP client,

@@ -470,19 +470,9 @@ class SectionCapture:
         else:
             scrolls = plan.max_scrolls if plan.max_scrolls is not None else 5
             pause = 0.5
-        if plan.mode & (CaptureMode.ACTIVITY | CaptureMode.POST_PERMALINKS):
-            # An endless list, where every scroll asks LinkedIn for the next
-            # batch: counted and paced like the rest of the traffic
-            # (`core/pacing.py`), and cut short when the budget runs out.
-            # Scrolling a page that is already loaded, below, costs nothing.
-            gate = pacing.gate()
-            scrolls = gate.loads_allowed(scrolls)
-            made = await self._session.scroll_body(
-                pause_time=gate.load_pause(pause), max_scrolls=scrolls
-            )
-            gate.record_loads(scrolls if made is None else made)
-        else:
-            await self._session.scroll_body(pause_time=pause, max_scrolls=scrolls)
+        # Each scroll that loads more is asked of, paced by and counted against
+        # the rate limit inside the scroll itself (`core/utils.py`).
+        await self._session.scroll_body(pause_time=pause, max_scrolls=scrolls)
 
         raw_result = await self._content._extract_root_content(["main"])
         raw = raw_result["text"]

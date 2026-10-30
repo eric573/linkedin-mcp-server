@@ -649,6 +649,54 @@ class TestGetCompanyEmployees:
         mock_page.goto.assert_not_awaited()
 
 
+def _hold_back_loads() -> None:
+    """Make the gate refuse the in-page loads a page asks for, as a stop does."""
+    from linkedin_mcp_server.config.schema import RateLimitConfig
+    from linkedin_mcp_server.core import pacing
+
+    gate = pacing.Pacing(RateLimitConfig(), None)
+    gate.record_pushback("http_429")
+    pacing.install_gate(gate)
+    assert gate.loads_allowed(1) == 0
+
+
+class TestEmployeesCutShort:
+    async def test_a_list_the_rate_limit_stopped_scrolling_says_so(self, mock_page):
+        from linkedin_mcp_server.core import pacing
+
+        reader = _reader(mock_page)
+
+        async def capture(*args, **kwargs):
+            _hold_back_loads()
+            return extracted("Ada\nBob")
+
+        with (
+            patch.object(reader._capture, "capture", side_effect=capture),
+            pacing.tool_call(deadline=None),
+        ):
+            result = await reader.get_company_employees("acme")
+
+        assert result["sections"] == {"employees": "Ada\nBob"}
+        assert result["section_errors"]["employees"]["error_type"] == "rate_limit"
+
+    async def test_a_list_that_loaded_whole_carries_no_error(self, mock_page):
+        from linkedin_mcp_server.core import pacing
+
+        reader = _reader(mock_page)
+        with (
+            patch.object(
+                reader._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("Ada\nBob"),
+            ),
+            pacing.tool_call(deadline=None),
+        ):
+            result = await reader.get_company_employees("acme")
+
+        assert "section_errors" not in result
+
+
 class TestSearchCompanies:
     async def test_the_results_page_is_returned_under_the_search_url(self, mock_page):
         reader = _reader(mock_page)

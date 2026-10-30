@@ -848,6 +848,11 @@ class ConnectionActions:
             # locale), and accepting/ignoring is irreversible. When the
             # fingerprint does not match we report send_failed rather than
             # guess.
+            #
+            # No invitation limit counts an accept, but it is a change the
+            # rest of the call has to confirm, so from here on the call is
+            # paced and never refused, as after a sent invitation.
+            pacing.mark_write_submitted()
             clicked = await self._click_incoming_accept()
             if not clicked:
                 return _connection_result(

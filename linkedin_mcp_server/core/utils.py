@@ -14,6 +14,7 @@ from patchright.async_api import (
 
 from .auth import raise_if_auth_route
 from .destination import linkedin_element
+from . import pacing
 from .exceptions import OffLinkedInLandingError, RateLimitError
 from .pacing import note_slow_down_page
 
@@ -331,25 +332,40 @@ async def scroll_to_bottom(
 ) -> int:
     """Scroll to the bottom of the page to trigger lazy loading.
 
+    A scroll that grows the page made LinkedIn send more of it, on an endless
+    list and on a profile alike, so each scroll asks the rate limit first,
+    waits at least its pause between loads, and is counted as soon as the page
+    is seen to have grown (`core/pacing.py`). Counted one at a time rather
+    than after the loop, so a call cancelled or redirected partway has already
+    counted what it loaded. The scroll that finds the page complete costs
+    nothing. A stop or a spent budget ends the scrolling, and the page is read
+    as far as it got.
+
     Args:
         page: Patchright page object
         pause_time: Time to pause between scrolls (seconds)
         max_scrolls: Maximum number of scroll attempts
 
     Returns:
-        How many scrolls were made, which the rate limit counts for a list
-        that loads more as it goes.
+        How many scrolls loaded more of the page.
     """
+    gate = pacing.gate()
+    loaded = 0
     for i in range(max_scrolls):
+        if gate.loads_allowed(1) < 1:
+            logger.debug("Scrolling stopped by the rate limit after %d scrolls", i)
+            break
         previous_height = await page.evaluate("document.body.scrollHeight")
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(pause_time)
+        await asyncio.sleep(gate.load_pause(pause_time))
 
         new_height = await page.evaluate("document.body.scrollHeight")
         if new_height == previous_height:
             logger.debug("Reached bottom after %d scrolls", i + 1)
-            return i + 1
-    return max_scrolls
+            break
+        gate.record_loads(1)
+        loaded += 1
+    return loaded
 
 
 async def scroll_job_sidebar(
@@ -491,6 +507,12 @@ async def scroll_job_sidebar(
         scrolls = 0
         timed_out = False
         capped_out = False
+        # Every round asks LinkedIn for the next batch of cards, so it asks the
+        # rate limit first, is counted when its cards arrive, and starts no
+        # sooner after the round before than the pause between loads
+        # (`core/pacing.py`). A stop or a spent budget ends the scrolling.
+        gate = pacing.gate()
+        last_load: float | None = None
 
         while True:
             if scrolls >= max_scrolls:
@@ -499,6 +521,16 @@ async def scroll_job_sidebar(
             if time.monotonic() >= hard_deadline:
                 timed_out = True
                 break
+            if gate.loads_allowed(1) < 1:
+                logger.debug("Job sidebar scrolling stopped by the rate limit")
+                break
+            if last_load is not None:
+                spacing = gate.load_pause(0.0) - (time.monotonic() - last_load)
+                if spacing > 0:
+                    if time.monotonic() + spacing >= hard_deadline:
+                        timed_out = True
+                        break
+                    await asyncio.sleep(spacing)
 
             round_started = time.monotonic()
             before = await _rail_step(page, holder, scroll=True)
@@ -516,6 +548,8 @@ async def scroll_job_sidebar(
                 timed_out = time.monotonic() >= hard_deadline
                 break
 
+            gate.record_loads(1)
+            last_load = round_started
             took = time.monotonic() - round_started
             budget = min(settle_timeout, max(min_budget, took * 3))
             scrolls += 1

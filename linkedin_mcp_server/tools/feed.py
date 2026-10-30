@@ -15,9 +15,13 @@ from fastmcp import Context, FastMCP
 from pydantic import Field
 
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.dependencies import get_ready_extractor, tool_errors
 from linkedin_mcp_server.linkedin.contracts import RATE_LIMITED_SECTION_TEXT
-from linkedin_mcp_server.linkedin.contracts import rate_limited_section_error
+from linkedin_mcp_server.linkedin.contracts import (
+    cut_short_section_error,
+    rate_limited_section_error,
+)
 from linkedin_mcp_server.linkedin.link_metadata import Reference
 
 logger = logging.getLogger(__name__)
@@ -71,6 +75,7 @@ def register_feed_tools(
             progress=0, total=100, message="Reading the home feed"
         )
 
+        held_back = pacing.loads_held_back()
         extracted = await extractor.extract_feed(num_posts=num_posts)
 
         url = "https://www.linkedin.com/feed/"
@@ -81,6 +86,12 @@ def register_feed_tools(
             sections["feed"] = extracted.text
             if extracted.references:
                 references["feed"] = extracted.references
+            # Fewer posts than asked for, because the rate limit stopped the
+            # scrolling, not because the feed ran out.
+            if pacing.loads_held_back() > held_back:
+                section_errors["feed"] = cut_short_section_error(
+                    pacing.cut_short_retry_after()
+                )
         elif extracted.text == RATE_LIMITED_SECTION_TEXT:
             section_errors["feed"] = rate_limited_section_error()
         elif extracted.error:

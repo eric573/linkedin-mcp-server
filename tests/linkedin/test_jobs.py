@@ -3785,3 +3785,128 @@ class TestResumingFromACursor:
             "next_cursor": make_cursor(1, result["url"]),
             "reason": "rate_limited",
         }
+
+
+class TestOutOfTimeIsNotARateLimit:
+    """The gate refusing a wait the call has no time for ends paging on time."""
+
+    @staticmethod
+    def _out_of_time():
+        return pacing.PacingRefusedError(
+            "Rate limit: this call has no time left to wait 4 seconds", 4, kind="time"
+        )
+
+    async def test_job_search_stops_on_its_time_budget(self, mock_page):
+        reader = _reader(mock_page)
+        refused = self._out_of_time()
+
+        async def read_page(url, section_name, **kwargs):
+            if "start=" in url:
+                raise refused
+            navigate(mock_page, url)
+            return captured(mock_page, extracted("Job results"))
+
+        with (
+            patch.object(reader._pages, "_extract_search_page", side_effect=read_page),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["101", "102"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.search_jobs("python", max_pages=3)
+
+        assert "section_errors" not in result
+        assert result["pagination"]["reason"] == "time_budget"
+        assert result["pagination"]["next_cursor"] == make_cursor(2, result["url"])
+
+    async def test_saved_jobs_stop_on_their_time_budget(self, mock_page):
+        mock_page.url = "https://www.linkedin.com/jobs-tracker/?stage=saved"
+        reader = _reader(mock_page)
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_saved_jobs_page",
+                new_callable=AsyncMock,
+                side_effect=[
+                    captured(mock_page, extracted("Saved Job 1")),
+                    self._out_of_time(),
+                ],
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["111"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=3)
+
+        assert "section_errors" not in result
+        assert result["pagination"]["reason"] == "time_budget"
+
+
+def _hold_back_loads() -> None:
+    """Make the gate refuse the in-page loads a page asks for, as a stop does."""
+    from linkedin_mcp_server.config.schema import RateLimitConfig
+    from linkedin_mcp_server.core import pacing
+
+    gate = pacing.Pacing(RateLimitConfig(), None)
+    gate.record_pushback("http_429")
+    pacing.install_gate(gate)
+    assert gate.loads_allowed(1) == 0
+
+
+class TestSavedJobsCutShort:
+    async def test_a_page_the_rate_limit_stopped_loading_is_read_again(self, mock_page):
+        mock_page.url = "https://www.linkedin.com/jobs-tracker/?stage=saved"
+        reader = _reader(mock_page)
+        pages = iter([extracted("Saved 1"), extracted("Saved 2")])
+        ids = iter([["301"], ["302"]])
+
+        async def read_page(url, *args, **kwargs):
+            navigate(mock_page, url)
+            if "start=10" in url:
+                _hold_back_loads()
+            return captured(mock_page, next(pages))
+
+        with (
+            patch.object(
+                reader._pages, "_extract_saved_jobs_page", side_effect=read_page
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                side_effect=lambda *a, **k: next(ids),
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            pacing.tool_call(deadline=None),
+        ):
+            result = await reader.get_saved_jobs(max_pages=3)
+
+        assert result["job_ids"] == ["301", "302"]
+        assert result["section_errors"]["saved_jobs"]["error_type"] == "rate_limit"
+        assert result["pagination"] == {
+            "pages_fetched": 2,
+            "next_cursor": make_cursor(1, result["url"]),
+            "reason": "rate_limited",
+        }

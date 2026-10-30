@@ -16,7 +16,9 @@ from .exceptions import (
     AccountRestrictedError,
     AuthenticationError,
     OffLinkedInLandingError,
+    RateLimitError,
 )
+from . import pacing
 from .pacing import note_account_restricted, note_auth_route
 
 logger = logging.getLogger(__name__)
@@ -280,6 +282,11 @@ async def resolve_remember_me_prompt(page: Page, *, timeout: int | None = None) 
         # portal's page, so whatever address was seen earlier says nothing
         # about this button. Only its own document does, and the click goes
         # through the handle that was asked.
+        # The click signs the account in and loads the page behind the
+        # chooser, so it is a page visit like any other: paced, counted, and
+        # refused during a stop.
+        gate = pacing.gate()
+        await gate.before_visit(page.url)
         try:
             async with linkedin_element(target, timeout=operation_timeout) as button:
                 logger.info("Clicking LinkedIn saved-account chooser to resume session")
@@ -319,6 +326,7 @@ async def resolve_remember_me_prompt(page: Page, *, timeout: int | None = None) 
             )
         except PlaywrightTimeoutError:
             logger.debug("Remember-me prompt click did not finish loading in time")
+        gate.after_visit()
 
         if deadline is None or loop is None:
             await asyncio.sleep(1)
@@ -330,6 +338,10 @@ async def resolve_remember_me_prompt(page: Page, *, timeout: int | None = None) 
     except PlaywrightTimeoutError:
         logger.debug("Remember-me prompt was present but not clickable in time")
         return False
+    except RateLimitError:
+        # The rate limit refused the click. Read as "no chooser" it would
+        # reach the sign-in check, which reports an expired session.
+        raise
     except Exception:
         logger.debug("Failed to resolve remember-me prompt", exc_info=True)
         return False

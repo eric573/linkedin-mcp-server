@@ -739,9 +739,9 @@ With a paid provider, use a sticky residential session that holds one address (n
 Everything the server asks of LinkedIn draws on one budget for the whole account, whichever tool asks and whichever MCP client it came from:
 
 - A random 3-6 second pause before each page visit.
-- At most 60 page visits in any hour and 300 in any 24 hours. Opening a conversation counts as a visit, and every five scrolls or "Show more" clicks that load more items count as one. Scrolling a page that is already loaded is free.
+- At most 60 page visits in any hour and 300 in any 24 hours. Opening a conversation counts as a visit, and every five scrolls or "Show more" clicks that load more (a profile's lazy sections, a list, the job results rail) count as one; the scroll that finds the page complete is free. A section the limit stopped loading partway is returned with a `rate_limit` section error beside it, so a shorter list never reads as complete.
 - At most 20 invitations a day and 100 a week, and 50 messages a day.
-- When LinkedIn pushes back (HTTP 429 or 999, its rate-limit page, or a page still empty after a retry), every request stops: as long as LinkedIn asks and at least 15 minutes, doubling for each repeat within a day. A checkpoint or CAPTCHA met during a tool call stops tool calls for 24 hours; signing in yourself is never blocked.
+- When LinkedIn pushes back (HTTP 429 or 999, its rate-limit page, or a page still empty after a retry), every request stops, from tool calls and the CLI alike: as long as LinkedIn asks (up to a day) and at least 15 minutes, twice as long as the previous stop when it comes within a day of it. A checkpoint or CAPTCHA met during a tool call stops tool calls for 24 hours; signing in yourself is never blocked.
 
 A call that would have to wait more than 30 seconds, or longer than it has left, is refused with the `rate_limited` error code and `retry_after` in seconds, and keeps any pages it already read. `get_session_status` shows what is spent and when the next visit is allowed, without opening the browser. LinkedIn publishes none of its limits, so these are cautious guesses, and every one is a setting.
 
@@ -765,7 +765,7 @@ All optional; `0` turns a limit off. See [`.env.example`](.env.example) for the 
 - `RATE_LIMIT_SEARCH_PAGES_PER_MONTH` - people-search pages per calendar month, for a free account that meets LinkedIn's monthly search limit (default `0`, off)
 - `RATE_LIMIT_STOP_MINUTES`, `RATE_LIMIT_EMPTY_PAGE_STOP_MINUTES`, `RATE_LIMIT_CHALLENGE_STOP_HOURS` - how long requests stop when LinkedIn pushes back (defaults `15`, `5`, `24`)
 
-What has been spent is kept in `rate-limit.json` next to your saved session, so restarts do not reset it and every server process sharing the session spends one budget. To reset it, stop the server and delete the file.
+What has been spent is kept in `rate-limit.json` next to your saved session, so restarts do not reset it and every server process sharing the session spends one budget. To reset it, stop the server and delete the file. A file that cannot be read never hands out a fresh budget: with no history to fall back on, the server stops for a day and holds invitations for a week.
 
 </details>
 

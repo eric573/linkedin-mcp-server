@@ -12,6 +12,7 @@ import pytest
 import linkedin_mcp_server.cli_main as cli_main
 from linkedin_mcp_server.config.schema import AppConfig, ConfigurationError
 from linkedin_mcp_server.core.exceptions import AccountRestrictedError
+from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.exceptions import (
     BrowserDowngradeError,
     ProfileRootRefusedError,
@@ -363,8 +364,17 @@ def test_main_non_interactive_no_auth_still_starts_server(
             AccountRestrictedError(),
             ("restricted access to this account", "will not open a login window"),
         ),
+        (
+            PacingRefusedError(
+                "Rate limit stop: LinkedIn answered HTTP 429 (too many requests), "
+                "so the server is not sending LinkedIn anything until 15:15 UTC",
+                900,
+                kind="stop",
+            ),
+            ("Session not checked", "HTTP 429", "15:15 UTC"),
+        ),
     ],
-    ids=["downgrade", "restricted account"],
+    ids=["downgrade", "restricted account", "rate limit stop"],
 )
 def test_profile_info_reports_a_refusal_plainly(
     monkeypatch: pytest.MonkeyPatch,

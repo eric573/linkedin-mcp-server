@@ -17,6 +17,7 @@ from linkedin_mcp_server.linkedin.capture import (
 )
 from linkedin_mcp_server.linkedin.contracts import (
     RATE_LIMITED_SECTION_TEXT,
+    cut_short_section_error,
     rate_limited_section_error,
 )
 from linkedin_mcp_server.linkedin.link_metadata import (
@@ -86,6 +87,7 @@ async def walk_result_pages(
 
         page_started = time.monotonic()
         waited_before = gate.waited_seconds
+        held_back = pacing.loads_held_back()
         try:
             extracted = await capture.capture(
                 page_url(page),
@@ -96,6 +98,11 @@ async def walk_result_pages(
             # Nothing read means the refusal is the answer.
             if not texts:
                 raise
+            # Out of time for the gate's wait is this walk's own time budget,
+            # not LinkedIn or a limit.
+            if refused.kind == "time":
+                reason = "time_budget"
+                break
             section_errors["search_results"] = rate_limited_section_error(
                 str(refused), retry_after=refused.retry_after
             )
@@ -139,6 +146,16 @@ async def walk_result_pages(
         texts.append(extracted.text)
         references.extend(extracted.references)
         next_page = page + 1
+        # The rate limit stopped this page loading all of its results. What it
+        # showed is kept, and the cursor reads the page again in full rather
+        # than skip the ones it held back.
+        if pacing.loads_held_back() > held_back:
+            section_errors["search_results"] = cut_short_section_error(
+                pacing.cut_short_retry_after()
+            )
+            reason = "rate_limited"
+            next_page = page
+            break
     else:
         reason = "max_pages"
 

@@ -60,8 +60,10 @@ class ScriptedPages:
         seconds: float = 0.0,
         gate: Any = None,
         gate_wait: float = 0.0,
+        on_capture: Any = None,
     ):
         self.answers = answers
+        self._on_capture = on_capture
         self.asked: list[int] = []
         self.plans: list[Any] = []
         self._clock = clock
@@ -78,6 +80,8 @@ class ScriptedPages:
             self._clock[0] += self._seconds
         if self._gate is not None:
             self._gate.waited_seconds += self._gate_wait
+        if self._on_capture is not None:
+            self._on_capture(page)
         answer = self.answers[page]
         if isinstance(answer, Exception):
             raise answer
@@ -355,3 +359,57 @@ class TestTimeBudget:
 
         assert pages.asked == [1]
         assert result["pagination"]["reason"] == "max_pages"
+
+
+class TestOutOfTime:
+    async def test_no_time_left_for_the_gates_wait_is_the_time_budget(self):
+        """Not LinkedIn and not a limit, so no rate_limit error goes with it."""
+        out_of_time = PacingRefusedError(
+            "Rate limit: this call has no time left", 5, kind="time"
+        )
+        pages = ScriptedPages({1: shown("Ada", people("ada")), 2: out_of_time})
+
+        result = await walk(pages, max_pages=3)
+
+        assert "section_errors" not in result
+        assert result["pagination"]["reason"] == "time_budget"
+        assert resumes_at(result) == 2
+
+
+def hold_back_loads() -> None:
+    """Make the gate refuse the in-page loads a page asks for, as a stop does."""
+    from linkedin_mcp_server.config.schema import RateLimitConfig
+
+    gate = pacing.Pacing(RateLimitConfig(), None)
+    gate.record_pushback("http_429")
+    pacing.install_gate(gate)
+    assert gate.loads_allowed(1) == 0
+
+
+class TestAPageCutShort:
+    async def test_a_page_the_rate_limit_stopped_loading_is_read_again(self):
+        """Its results are kept, and the cursor reads it again in full."""
+
+        def on_capture(page: int) -> None:
+            if page == 2:
+                hold_back_loads()
+
+        pages = ScriptedPages(
+            {
+                1: shown("Ada", people("ada")),
+                2: shown("Bob", people("bob")),
+                3: shown("Cy", people("cy")),
+            },
+            on_capture=on_capture,
+        )
+
+        with pacing.tool_call(deadline=None):
+            result = await walk(pages, max_pages=3)
+
+        assert pages.asked == [1, 2]
+        assert result["sections"] == {"search_results": "Ada\n---\nBob"}
+        error = result["section_errors"]["search_results"]
+        assert error["error_type"] == "rate_limit"
+        assert error["retry_after"] > 0
+        assert result["pagination"]["reason"] == "rate_limited"
+        assert resumes_at(result) == 2

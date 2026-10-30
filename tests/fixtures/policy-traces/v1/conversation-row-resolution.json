@@ -215,15 +215,48 @@
     },
     {
       "arg": {
-        "limit": 10,
-        "nameFilter": null,
-        "pauseHighMs": 3000.0,
-        "pauseLowMs": 1500.0
+        "nameFilter": null
       },
       "call": "get_inbox",
       "kind": "evaluate",
-      "operation": "conversation_thread_refs",
-      "program_digest": "3ea1747cc5b1",
+      "operation": "conversation_row_list",
+      "program_digest": "ee63952d41ad",
+      "section": "conversation"
+    },
+    {
+      "call": "get_inbox",
+      "kind": "sleep",
+      "reason": "sleep",
+      "seconds": 2.25,
+      "section": "conversation"
+    },
+    {
+      "arg": {
+        "ariaLabel": "Select conversation with Ada Lovelace",
+        "position": 0
+      },
+      "call": "get_inbox",
+      "kind": "evaluate",
+      "operation": "conversation_row_click",
+      "program_digest": "743c66c991dd",
+      "section": "conversation"
+    },
+    {
+      "call": "get_inbox",
+      "kind": "sleep",
+      "reason": "sleep",
+      "seconds": 2.25,
+      "section": "conversation"
+    },
+    {
+      "arg": {
+        "ariaLabel": "Select conversation with Bob Stall",
+        "position": 1
+      },
+      "call": "get_inbox",
+      "kind": "evaluate",
+      "operation": "conversation_row_click",
+      "program_digest": "743c66c991dd",
       "section": "conversation"
     }
   ],

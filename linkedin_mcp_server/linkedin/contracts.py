@@ -99,6 +99,20 @@ def rate_limited_section_error(
     return error
 
 
+def cut_short_section_error(retry_after: int) -> dict[str, Any]:
+    """The entry for a section the rate limit stopped loading partway.
+
+    The text read is kept beside it: what is missing is the rest of a list
+    the gate would not let load, which a shorter list alone would hide.
+    """
+    return rate_limited_section_error(
+        "The rate limit stopped this section from loading more, so it may "
+        f"continue past what is shown. The rest can be read in {retry_after} "
+        "seconds.",
+        retry_after=retry_after,
+    )
+
+
 class _Omitted:
     """A result field the caller did not pass."""
 

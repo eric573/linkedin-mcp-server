@@ -456,6 +456,44 @@ async def test_resolve_remember_me_prompt_clicks_saved_account():
     page.wait_for_load_state.assert_awaited_once()
 
 
+def _gate_with(**limits):
+    from linkedin_mcp_server.config.schema import RateLimitConfig
+    from linkedin_mcp_server.core import pacing
+
+    gate = pacing.Pacing(
+        RateLimitConfig(pause_min_seconds=0, pause_max_seconds=0, **limits), None
+    )
+    pacing.install_gate(gate)
+    return gate
+
+
+@pytest.mark.asyncio
+async def test_the_chooser_click_is_a_page_visit():
+    """It signs in and loads the page behind it, so the rate limit counts it."""
+    gate = _gate_with()
+    page, button = _chooser_page()
+
+    assert await resolve_remember_me_prompt(page) is True
+
+    button.click.assert_awaited_once()
+    assert gate.status()["visits"]["last_hour"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stop_refuses_the_chooser_click_rather_than_reading_as_no_chooser():
+    """Read as no chooser, the sign-in check after it reports an expired session."""
+    from linkedin_mcp_server.core.pacing import PacingRefusedError
+
+    gate = _gate_with()
+    gate.record_pushback("http_429")
+    page, button = _chooser_page()
+
+    with pytest.raises(PacingRefusedError):
+        await resolve_remember_me_prompt(page)
+
+    button.click.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_resolve_remember_me_prompt_returns_false_when_absent():
     page = MagicMock()

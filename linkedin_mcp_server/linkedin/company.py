@@ -8,6 +8,7 @@ from urllib.parse import quote_plus
 import logging
 
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
@@ -18,6 +19,7 @@ from linkedin_mcp_server.linkedin.capture import (
 )
 from linkedin_mcp_server.linkedin.contracts import (
     RATE_LIMITED_SECTION_TEXT,
+    cut_short_section_error,
     rate_limited_section_error,
 )
 from linkedin_mcp_server.linkedin.fields import COMPANY_SECTIONS, _company_section_specs
@@ -76,6 +78,7 @@ class CompanyReader:
             for i, spec in enumerate(requested_ordered):
                 section_name = spec.name
                 url = base_url + spec.suffix
+                held_back = pacing.loads_held_back()
                 try:
                     if CaptureMode.OVERLAY in spec.plan.mode:
                         extracted = await self._capture._extract_overlay(
@@ -92,6 +95,10 @@ class CompanyReader:
                         sections[section_name] = extracted.text
                         if extracted.references:
                             references[section_name] = extracted.references
+                        if pacing.loads_held_back() > held_back:
+                            section_errors[section_name] = cut_short_section_error(
+                                pacing.cut_short_retry_after()
+                            )
                     elif extracted.text == RATE_LIMITED_SECTION_TEXT:
                         section_errors[section_name] = rate_limited_section_error()
                         rate_limited = True
@@ -162,6 +169,7 @@ class CompanyReader:
         url = company_page_url(company_name, "/people/")
         if keywords:
             url += f"?keywords={quote_plus(keywords)}"
+        held_back = pacing.loads_held_back()
         extracted = await self._capture.capture(
             url,
             "employees",
@@ -175,6 +183,12 @@ class CompanyReader:
             sections["employees"] = extracted.text
             if extracted.references:
                 references["employees"] = extracted.references
+            # The list grows as it scrolls, so one the rate limit stopped is
+            # shorter than the company's.
+            if pacing.loads_held_back() > held_back:
+                section_errors["employees"] = cut_short_section_error(
+                    pacing.cut_short_retry_after()
+                )
         elif extracted.text == RATE_LIMITED_SECTION_TEXT:
             section_errors["employees"] = rate_limited_section_error()
         elif extracted.error:

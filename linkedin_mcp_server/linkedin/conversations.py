@@ -13,12 +13,16 @@ import re
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core import pacing
+from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.core.exceptions import (
     InvalidReferenceError,
     LinkedInOperationError,
 )
 from linkedin_mcp_server.linkedin.content import PageContentReader
-from linkedin_mcp_server.linkedin.contracts import rate_limited_section_error
+from linkedin_mcp_server.linkedin.contracts import (
+    cut_short_section_error,
+    rate_limited_section_error,
+)
 from linkedin_mcp_server.linkedin.identifiers import (
     messaging_thread_url,
     normalize_person_identifier,
@@ -60,6 +64,96 @@ def strip_select_conversation_prefix(aria_label: str) -> str:
 # pathname unchanged, so it cannot be verified. Measured 2026-09-25, see
 # docs/decisions/2026-09-25-fail-closed-thread-attribution.md.
 _COMPOSE_URL = "https://www.linkedin.com/messaging/compose/"
+
+# Thread identity is the pathname's thread id and nothing else: a query, hash
+# or trailing-slash change on the same thread is not a move, and a thread
+# marker in a query is not a thread.
+_THREAD_ID_OF_JS = """
+    const idOf = () => {
+        const match = location.pathname.match(
+            /^\\/messaging\\/thread\\/([^/]+)\\/?$/
+        );
+        if (!match) return null;
+        try {
+            return decodeURIComponent(match[1]) === 'new' ? null : match[1];
+        } catch {
+            return null;
+        }
+    };
+"""
+
+# The conversation rows, read without clicking any. The Ember click handler
+# lives on an inner div; the <li> and <label> don't trigger SPA navigation.
+# No role/aria attributes exist on the clickable element, so class-name
+# selectors are unavoidable here. The aria-label value flows through
+# unmodified: Python strips any known locale prefix to derive a clean
+# participant name for refs.
+_LIST_CONVERSATION_ROWS_JS = (
+    """({ nameFilter }) => {"""
+    + _THREAD_ID_OF_JS
+    + """
+    const labels = Array.from(document.querySelectorAll(
+        'main li label[aria-label]'
+    ));
+    // Normalize the optional participant filter by whitespace and case
+    // only. The en-US verb is stripped from row labels below, never from
+    // the filter, which is a display name. Only a matching row is clicked;
+    // clicking marks a row read, so unrelated threads must not be clicked.
+    const wanted = (nameFilter || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    // Kept for the clicks that follow, on this document and in this
+    // script's own world, which LinkedIn's scripts do not share.
+    document.__linkedinMcpConversationRows = labels;
+    return {
+        startThreadId: idOf(),
+        rows: labels.map(label => {
+            const ariaLabel = label.getAttribute('aria-label') || '';
+            const rowName = ariaLabel
+                .replace(/^Select conversation with\\s+/i, '')
+                .replace(/\\s+/g, ' ').trim().toLowerCase();
+            return {
+                ariaLabel,
+                matches: !wanted || rowName === wanted,
+                clickable: Boolean(
+                    label.closest('li')
+                        ?.querySelector('div[class*="listitem__link"]')
+                ),
+            };
+        }),
+    };
+}"""
+)
+
+# One row clicked, and the thread it opened. The row must still be the one
+# listed: a list LinkedIn re-rendered since would hand it another row's
+# thread, so a changed row reads as a click that opened nothing.
+_CLICK_CONVERSATION_ROW_JS = (
+    """async ({ position, ariaLabel }) => {"""
+    + _THREAD_ID_OF_JS
+    + """
+    const label = (document.__linkedinMcpConversationRows || [])[position];
+    if (!label || (label.getAttribute('aria-label') || '') !== ariaLabel) {
+        return { threadId: null };
+    }
+    const clickTarget = label.closest('li')
+        ?.querySelector('div[class*="listitem__link"]');
+    if (!clickTarget) return { threadId: null };
+    // Read fresh for every row: after an earlier row moved the page, the
+    // thread that was open at scan start is a real destination for its
+    // own row.
+    const before = idOf();
+    clickTarget.click();
+    // Poll for the SPA URL to settle on a different thread. The Ember
+    // click handler can take a moment to bind after the label mounts, and
+    // a fixed sleep races the click. Nor is the pre-click id credited to
+    // this row.
+    for (let waits = 0; waits < 12; waits++) {
+        await new Promise(r => setTimeout(r, 100));
+        const now = idOf();
+        if (now !== null && now !== before) return { threadId: now };
+    }
+    return { threadId: null };
+}"""
+)
 
 _SCAN_STARTED_ON_THREAD = (
     " The scan began on a thread path. An unchanged pre-click thread ID was"
@@ -336,7 +430,12 @@ class ConversationReader:
         counted and paced by the rate limit (`core/pacing.py`).
         """
         gate = pacing.gate()
-        for _ in range(gate.loads_allowed(attempts)):
+        for _ in range(attempts):
+            # Asked before every scroll rather than once for all of them, so a
+            # stop that starts partway ends the scrolling.
+            if gate.loads_allowed(1) < 1:
+                logger.debug("Conversation list scrolling stopped by the rate limit")
+                break
             await self._session.run_on_linkedin(
                 """({ position }) => {
                     const main = document.querySelector('main');
@@ -444,150 +543,77 @@ class ConversationReader:
             if allowed == 0:
                 raise gate.opens_refusal()
             allowed = limit
-        pause_low, pause_high = gate.conversation_pause_range()
 
-        # The Ember click handler lives on an inner div; the <li> and <label>
-        # don't trigger SPA navigation.  No role/aria attributes exist on the
-        # clickable element, so class-name selectors are unavoidable here.
-        # The aria-label value flows through unmodified — Python strips any
-        # known locale prefix to derive a clean participant name for refs.
-        outcome: dict[str, Any] = await self._session.run_on_linkedin(
-            """async ({ limit, nameFilter, pauseLowMs, pauseHighMs }) => {
-                const labels = Array.from(document.querySelectorAll(
-                    'main li label[aria-label]'
-                ));
-                const cap = (limit == null)
-                    ? labels.length
-                    : Math.min(labels.length, limit);
-                // Normalize the optional participant filter by whitespace and
-                // case only. The en-US verb is stripped from row labels below,
-                // never from the filter, which is a display name. Only a
-                // matching row is clicked; clicking marks a row read, so
-                // unrelated threads must not be clicked.
-                const wanted = (nameFilter || '')
-                    .replace(/\\s+/g, ' ').trim().toLowerCase();
-                // Thread identity is the pathname's thread id and nothing
-                // else: a query, hash or trailing-slash change on the same
-                // thread is not a move, and a thread marker in a query is not
-                // a thread.
-                const idOf = () => {
-                    const match = location.pathname.match(
-                        /^\\/messaging\\/thread\\/([^/]+)\\/?$/
-                    );
-                    if (!match) return null;
-                    try {
-                        return decodeURIComponent(match[1]) === 'new' ? null : match[1];
-                    } catch {
-                        return null;
-                    }
-                };
-                const outcome = {
-                    rows: [],
-                    stoppedAt: null,
-                    firstIndexGap: null,
-                    startThreadId: idOf(),
-                    rowCount: labels.length,
-                };
-                for (let position = 0; position < cap; position++) {
-                    const label = labels[position];
-                    const ariaLabel = label.getAttribute('aria-label') || '';
-                    const rowName = ariaLabel
-                        .replace(/^Select conversation with\\s+/i, '')
-                        .replace(/\\s+/g, ' ').trim().toLowerCase();
-                    if (wanted && rowName !== wanted) continue;
-                    const clickTarget = label.closest('li')
-                        ?.querySelector('div[class*="listitem__link"]');
-                    if (!clickTarget) {
-                        // Skipped, not clicked. A listing loses only this
-                        // row; a username index cannot count past it.
-                        if (wanted && outcome.firstIndexGap === null) {
-                            outcome.firstIndexGap = {
-                                ariaLabel,
-                                position,
-                                precededBy: outcome.rows.length,
-                            };
-                        }
-                        continue;
-                    }
-                    // The pause the rate limit asks for between opens, drawn
-                    // at random so the clicks keep no fixed rhythm.
-                    const pause = pauseLowMs
-                        + Math.random() * (pauseHighMs - pauseLowMs);
-                    if (pause > 0) {
-                        await new Promise(r => setTimeout(r, pause));
-                    }
-                    // Read fresh for every row: after an earlier row moved the
-                    // page, the thread that was open at scan start is a real
-                    // destination for its own row.
-                    const before = idOf();
-                    clickTarget.click();
-                    // Poll for the SPA URL to settle on a different thread.
-                    // The Ember click handler can take a moment to bind after
-                    // the label mounts, and a fixed sleep races the click.
-                    let after = null;
-                    for (let waits = 0; waits < 12; waits++) {
-                        await new Promise(r => setTimeout(r, 100));
-                        const now = idOf();
-                        if (now !== null && now !== before) {
-                            after = now;
-                            break;
-                        }
-                    }
-                    // Stop, never continue: this click may still land, and a
-                    // later row polled meanwhile would be handed its thread.
-                    // Nor is the pre-click id credited to this row.
-                    if (after === null) {
-                        outcome.stoppedAt = { ariaLabel, position };
-                        break;
-                    }
-                    outcome.rows.push({ ariaLabel, threadId: after });
-                }
-                return outcome;
-            }""",
-            {
-                "limit": allowed,
-                "nameFilter": name_filter,
-                "pauseLowMs": pause_low * 1000,
-                "pauseHighMs": pause_high * 1000,
-            },
+        # The rows are read once and then clicked one at a time from here,
+        # never in one loop inside the page. Each click asks the rate limit
+        # first and is counted before it is made, so a stop that starts
+        # partway ends the scan, and a scan cancelled or redirected partway
+        # has counted every click it made. A loop inside the page went on
+        # clicking after the call that started it was gone.
+        listing: dict[str, Any] = await self._session.run_on_linkedin(
+            _LIST_CONVERSATION_ROWS_JS, {"nameFilter": name_filter}
         )
-        # Every click, including one that never opened a thread: the request
-        # may have gone out all the same.
-        gate.record_conversation_opens(
-            len(outcome["rows"]) + (1 if outcome["stoppedAt"] is not None else 0)
-        )
-        wanted = outcome.get("rowCount", 0)
+        listed: list[dict[str, Any]] = listing["rows"]
+        cap = len(listed) if allowed is None else min(len(listed), allowed)
+        opened: list[tuple[str, str]] = []
+        stopped_at: _StoppedRow | None = None
+        first_index_gap: _IndexGap | None = None
+        reached = cap
+        for position in range(cap):
+            row = listed[position]
+            aria_label: str = row["ariaLabel"]
+            if not row["matches"]:
+                continue
+            if not row["clickable"]:
+                # Skipped, not clicked. A listing loses only this row; a
+                # username index cannot count past it.
+                if name_filter is not None and first_index_gap is None:
+                    first_index_gap = _IndexGap(aria_label, position, len(opened))
+                continue
+            if gate.stop_active():
+                if name_filter is not None:
+                    raise gate.opens_refusal()
+                reached = position
+                break
+            # The pause the rate limit asks for between opens.
+            pause = gate.conversation_pause()
+            if pause > 0:
+                await self._session.delay(pause)
+            # Before the click, whatever comes of it: the request may go out
+            # even when no thread is seen to open.
+            gate.record_conversation_opens(1)
+            clicked: dict[str, Any] = await self._session.run_on_linkedin(
+                _CLICK_CONVERSATION_ROW_JS,
+                {"position": position, "ariaLabel": aria_label},
+            )
+            # Stop, never continue: this click may still land, and a later row
+            # polled meanwhile would be handed its thread.
+            if clicked["threadId"] is None:
+                stopped_at = _StoppedRow(aria_label, position)
+                break
+            opened.append((aria_label, clicked["threadId"]))
+        wanted = len(listed)
         if limit is not None:
             wanted = min(wanted, limit)
         held_back = 0
-        if outcome["stoppedAt"] is None and allowed is not None:
-            held_back = max(0, wanted - allowed)
+        if stopped_at is None:
+            held_back = max(0, wanted - reached)
         refs: list[Reference] = []
-        for conv in outcome["rows"]:
+        for aria_label, thread_id in opened:
             ref: Reference = {
                 "kind": "conversation",
-                "url": f"/messaging/thread/{conv['threadId']}/",
+                "url": f"/messaging/thread/{thread_id}/",
                 "context": context,
             }
-            name = strip_select_conversation_prefix(conv.get("ariaLabel", ""))
+            name = strip_select_conversation_prefix(aria_label)
             if name:
                 ref["text"] = name
             refs.append(ref)
-        stopped = outcome["stoppedAt"]
-        gap = outcome["firstIndexGap"]
         return _ThreadRefScan(
             refs=refs,
-            stopped_at=(
-                None
-                if stopped is None
-                else _StoppedRow(stopped["ariaLabel"], stopped["position"])
-            ),
-            first_index_gap=(
-                None
-                if gap is None
-                else _IndexGap(gap["ariaLabel"], gap["position"], gap["precededBy"])
-            ),
-            start_thread_id=outcome["startThreadId"],
+            stopped_at=stopped_at,
+            first_index_gap=first_index_gap,
+            start_thread_id=listing["startThreadId"],
             held_back=held_back,
             retry_after=(
                 max(1, math.ceil(gate.seconds_until_next_visit()))
@@ -735,6 +761,7 @@ class ConversationReader:
         await self._session.dismiss_modal()
 
         scrolls = max(1, limit // 10)
+        held_back = pacing.loads_held_back()
         await self._scroll_main_scrollable_region(
             position="bottom", attempts=scrolls, pause_time=0.5
         )
@@ -745,18 +772,37 @@ class ConversationReader:
         references: list[Reference] = (
             build_references(raw_result["references"], "inbox") if cleaned else []
         )
+        # The list loads more as it scrolls, so one the rate limit stopped
+        # scrolling shows fewer conversations than asked for.
+        text_cut_short = bool(cleaned) and pacing.loads_held_back() > held_back
 
         # LinkedIn's conversation sidebar uses JS click handlers instead of
         # <a> tags, so anchor extraction cannot capture thread IDs.  Click each
         # conversation item and read the resulting SPA URL to build references.
         # The text above stays from bare `/messaging/`; the clicks run on the
         # compose page, never here, see _COMPOSE_URL.
-        await self._navigator._navigate_to_page(_COMPOSE_URL)
-        await self._session.check_rate_limit()
-        await self._session.dismiss_modal()
-        scan = await self._extract_conversation_thread_refs(
-            limit=limit, context="inbox", scroll_attempts=scrolls
-        )
+        try:
+            await self._navigator._navigate_to_page(_COMPOSE_URL)
+            await self._session.check_rate_limit()
+            await self._session.dismiss_modal()
+            scan = await self._extract_conversation_thread_refs(
+                limit=limit, context="inbox", scroll_attempts=scrolls
+            )
+        except PacingRefusedError as refused:
+            # The inbox was read before the rate limit refused the page its
+            # thread links come from: kept, with when the rest can be had.
+            # Nothing read means the refusal is the answer.
+            if not cleaned:
+                raise
+            result = self._single_section_result(
+                url, "inbox", cleaned, references=references
+            )
+            result["section_errors"] = {
+                "inbox": rate_limited_section_error(
+                    str(refused), retry_after=refused.retry_after
+                )
+            }
+            return result
         if scan.refs:
             references = dedupe_references(scan.refs + references)
 
@@ -769,6 +815,10 @@ class ConversationReader:
         section_errors = _listing_section_errors(
             "inbox", scan, report_unavailable_rows=True
         )
+        if text_cut_short and not section_errors:
+            section_errors = {
+                "inbox": cut_short_section_error(pacing.cut_short_retry_after())
+            }
         if section_errors:
             result["section_errors"] = section_errors
         return result
@@ -812,6 +862,7 @@ class ConversationReader:
         await self._session.check_rate_limit()
         await self._wait_for_main_text(log_context="Conversation")
         await self._session.dismiss_modal()
+        held_back = pacing.loads_held_back()
         await self._scroll_main_scrollable_region(
             position="top", attempts=3, pause_time=0.5
         )
@@ -828,12 +879,19 @@ class ConversationReader:
             if cleaned
             else []
         )
-        return self._single_section_result(
+        result = self._single_section_result(
             self._session.page.url,
             "conversation",
             cleaned,
             references=references,
         )
+        # Older messages load as the thread scrolls up, so a thread the rate
+        # limit stopped scrolling starts later than it does.
+        if cleaned and pacing.loads_held_back() > held_back:
+            result["section_errors"] = {
+                "conversation": cut_short_section_error(pacing.cut_short_retry_after())
+            }
+        return result
 
     async def search_conversations(
         self, keywords: str, limit: int = 20

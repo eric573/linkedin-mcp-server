@@ -2664,6 +2664,34 @@ class TestGetCompanyEmployeesTool:
 
 
 class TestFeedTools:
+    async def test_a_feed_the_rate_limit_stopped_scrolling_says_so(
+        self, mock_context, serve_extractor
+    ):
+        """Fewer posts than asked for, because of the limit, not the feed's end."""
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+        from linkedin_mcp_server.tools.feed import register_feed_tools
+
+        async def extract_feed(num_posts: int) -> ExtractedSection:
+            gate = pacing.Pacing(RateLimitConfig(), None)
+            gate.record_pushback("http_429")
+            pacing.install_gate(gate)
+            assert gate.loads_allowed(1) == 0
+            return ExtractedSection(text="Post 1", references=[])
+
+        mock_extractor = MagicMock()
+        mock_extractor.extract_feed = AsyncMock(side_effect=extract_feed)
+        mcp = FastMCP("test")
+        register_feed_tools(mcp)
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "get_feed")
+
+        with pacing.tool_call(deadline=None):
+            result = await tool_fn(mock_context, num_posts=30)
+
+        assert result["sections"]["feed"] == "Post 1"
+        assert result["section_errors"]["feed"]["error_type"] == "rate_limit"
+
     async def test_get_feed_success(self, mock_context, serve_extractor):
         mock_extractor = MagicMock()
         mock_extractor.extract_feed = AsyncMock(

@@ -263,20 +263,21 @@ async def test_facade_trace_detects_optional_key_drift():
 _ROW_TRACE = "conversation-row-resolution.json"
 
 
-def _row_evaluation(trace: dict[str, Any]) -> dict[str, Any]:
+def _row_evaluation(
+    trace: dict[str, Any], operation: str = "conversation_row_list"
+) -> dict[str, Any]:
     return next(
-        event
-        for event in trace["events"]
-        if event.get("operation") == "conversation_thread_refs"
+        event for event in trace["events"] if event.get("operation") == operation
     )
 
 
 async def test_row_click_trace_reads_text_before_scanning_compose():
     """Text from bare `/messaging/`, then the click scan on the compose page.
 
-    The scripted page records the submitted row program without running it,
-    so this pins which program was sent and in what order, not what it does;
-    the browser-DOM suite executes it.
+    The scripted page records the submitted row programs without running them,
+    so this pins which programs were sent and in what order, not what they do;
+    the browser-DOM suite executes them. The rows are listed once, then each
+    is clicked by a program of its own, with the gate's pause before it.
     """
     trace = (await build_policy_traces())[_ROW_TRACE]
     events = trace["events"]
@@ -294,18 +295,21 @@ async def test_row_click_trace_reads_text_before_scanning_compose():
         positions["root_content"][0]
         < navigations[1]
         < positions["conversation_rows"][0]
-        < positions["conversation_thread_refs"][0]
+        < positions["conversation_row_list"][0]
+        < positions["conversation_row_click"][0]
     )
+    # Ada's click opened her thread, Bob's opened nothing, and nothing after.
+    assert len(positions["conversation_row_click"]) == 2
     assert row_evaluation["kind"] == "evaluate"
     assert row_evaluation["program_digest"]
-    # The pause between opens comes from the rate limit, which the scenario
-    # runs with its shipped settings.
-    assert row_evaluation["arg"] == {
-        "limit": 10,
-        "nameFilter": None,
-        "pauseLowMs": 1500.0,
-        "pauseHighMs": 3000.0,
-    }
+    assert row_evaluation["arg"] == {"nameFilter": None}
+    # Each click waits the rate limit's pause first, which the scenario runs
+    # with its shipped settings: 1.5-3 s, drawn at the midpoint here.
+    clicks = positions["conversation_row_click"]
+    for click in clicks:
+        pause = events[click - 1]
+        assert (pause["kind"], pause["seconds"]) == ("sleep", 2.25)
+    assert [events[click]["arg"]["position"] for click in clicks] == [0, 1]
     assert trace["result"]["url"] == "https://www.linkedin.com/messaging/"
     assert trace["result"]["sections"] == {"inbox": "Conversation content"}
     assert trace["result"]["references"] == {
@@ -367,7 +371,7 @@ async def test_row_click_trace_detects_a_changed_row_program():
     async def shorten_budget(
         self: ScriptedPage, expression: str, *args: Any, **kwargs: Any
     ) -> Any:
-        if "main li label[aria-label]" in expression and "waits < 12" in expression:
+        if "clickTarget.click()" in expression and "waits < 12" in expression:
             expression = expression.replace("waits < 12", "waits < 11")
             replaced.append(expression)
         return await original(self, expression, *args, **kwargs)
@@ -376,10 +380,13 @@ async def test_row_click_trace_detects_a_changed_row_program():
         mutated = await build_policy_traces()
 
     canonical = json.loads((TRACE_ROOT / _ROW_TRACE).read_text(encoding="utf-8"))
-    changed = _row_evaluation(mutated[_ROW_TRACE])
+    changed = _row_evaluation(mutated[_ROW_TRACE], "conversation_row_click")
     assert replaced
-    assert changed["operation"] == "conversation_thread_refs"
-    assert changed["program_digest"] != _row_evaluation(canonical)["program_digest"]
+    assert changed["operation"] == "conversation_row_click"
+    assert (
+        changed["program_digest"]
+        != _row_evaluation(canonical, "conversation_row_click")["program_digest"]
+    )
     assert f"--- {TRACE_ROOT / _ROW_TRACE}" in policy_trace_diff(
         {_ROW_TRACE: mutated[_ROW_TRACE]}
     )

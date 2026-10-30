@@ -353,6 +353,38 @@ class TestInvalidateAuthAndTriggerRelogin:
         assert state.auth_state is AuthState.STARTING
         assert state.login_task is not None
 
+    async def test_a_checkpoint_stop_says_when_to_retry_rather_than_now(
+        self, isolate_profile_dir, monkeypatch
+    ):
+        """A checkpoint stops tool calls for a day; signing in is never stopped.
+
+        "Retry this tool" right after signing in would be refused for that day.
+        """
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+
+        gate = pacing.Pacing(RateLimitConfig(), None)
+        gate.record_pushback("challenge")
+        pacing.install_gate(gate)
+        _make_auth_ready(isolate_profile_dir)
+
+        async def fake_login_flow():
+            return None
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._run_login_flow", fake_login_flow
+        )
+        initialize_bootstrap("managed")
+
+        with pytest.raises(AuthenticationStartedError) as started:
+            await invalidate_auth_and_trigger_relogin()
+
+        message = str(started.value)
+        assert "login browser window has been opened" in message
+        assert "security checkpoint" in message
+        assert "retry this tool" not in message
+        assert get_bootstrap_state().login_task is not None
+
     async def test_login_in_progress_does_not_move_files(
         self, isolate_profile_dir, monkeypatch
     ):
@@ -9690,6 +9722,49 @@ class TestAPortalDuringImportOpensNoLogin:
 
         assert started == []
         assert get_bootstrap_state().login_task is None
+
+
+class TestARateLimitDuringImportOpensNoLogin:
+    """A refused import check is the rate limit, not a missing session.
+
+    The import's validation visits the feed through the pacing gate, which
+    refuses during a stop or with the hour spent. A login window then would only
+    go through the same stop, and abandon a browser session that may be fine.
+    """
+
+    async def test_the_refusal_reaches_the_caller_and_the_import_is_tried_again(
+        self, isolate_profile_dir, monkeypatch, _stub_import_env
+    ):
+        from linkedin_mcp_server.core.pacing import PacingRefusedError
+
+        started: list[int] = []
+        imports: list[int] = []
+
+        async def fake_login_flow() -> None:
+            started.append(1)
+
+        async def refused_check(*_args, **_kwargs):
+            imports.append(1)
+            raise PacingRefusedError("Rate limit stop: LinkedIn answered 429", 900)
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._run_login_flow", fake_login_flow
+        )
+        # The real import wrapper runs, so its own handler is part of the path.
+        monkeypatch.setattr(_IMPORT_TARGET, refused_check)
+        _patch_inline_wait(monkeypatch, 5, auto_import=True)
+        initialize_bootstrap("managed")
+
+        with pytest.raises(PacingRefusedError, match="429"):
+            await ensure_tool_ready_or_raise("get_person_profile")
+        assert started == []
+        assert get_bootstrap_state().login_task is None
+
+        # Not spent: the next call tries the import again.
+        with pytest.raises(PacingRefusedError):
+            await ensure_tool_ready_or_raise("get_person_profile")
+        assert imports == [1, 1]
+        assert started == []
 
 
 class TestARestrictedAccountOpensNoLoginWindow:
