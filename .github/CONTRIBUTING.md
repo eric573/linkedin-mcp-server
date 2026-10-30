@@ -55,16 +55,20 @@ LinkedIn changes its class names, `data-` attributes and component structure oft
 
 LinkedIn is used in many languages, so never tell connection state, buttons or available actions apart by comparing visible labels such as "Connect", "Message" or "Pending". Rely on URL patterns, on whether an attribute like `aria-label` or `aria-expanded` exists at all, or on structural counts. If text really is the only signal, put it in an explicit per-locale table and say in a comment that other locales are not covered.
 
+### Pace every request
+
+Every page the server opens asks the pacing gate first, so one budget covers the whole account. Navigate through `PageNavigator._navigate_to_page`, which asks it already; a navigation anywhere else fails `tests/test_pacing.py`. A loop that makes LinkedIn send more inside a page, such as a scroll that loads the next batch or a click that opens a thread, asks `pacing.gate()` how many it may make and counts the ones it made. [Pace every LinkedIn request](../docs/decisions/2026-10-30-pace-every-linkedin-request.md) explains why.
+
 ### Return format
 
 Every tool that reads LinkedIn returns `{"url": str, "sections": {name: raw_text}}`. `sections` is the main payload. A tool may add:
 
 - `references`: `{section: [{kind, url, text?, context?, value?}]}`, compact links to people, companies and posts. LinkedIn URLs are relative paths to save tokens.
-- `section_errors`: `{section: {error_type, error_message, ...}}` for a problem with one section, reported without failing the whole call.
+- `section_errors`: `{section: {error_type, error_message, ...}}` for a problem with one section, reported without failing the whole call. When the rate limit stops a call partway, the sections already read are kept and its `rate_limit` entry carries `retry_after` in seconds.
 - `unknown_sections`: section names the caller asked for that do not exist.
 - `job_ids`: returned by `search_jobs` and `get_saved_jobs`.
 - `total` and `promoted_job_ids`: returned by `search_jobs`. `total` is `{count, exact}`, the result count LinkedIn advertises. `promoted_job_ids` is the promoted subset of `job_ids`.
-- `pagination`: returned by `search_jobs` unless a failure stopped it. `{pages_fetched, next_offset, reason}`, where `reason` is `complete`, `max_pages`, `time_budget` or `no_new_ids`.
+- `pagination`: returned by `search_jobs` unless a failure stopped it. `{pages_fetched, next_offset, reason}`, where `reason` is `complete`, `max_pages`, `time_budget`, `no_new_ids` or `rate_limited`.
 - `apply`: returned by `get_job_apply_url` instead of `sections`. `{type, url?}`, where `type` is `easy_apply`, `external`, `applied`, `closed` or `unknown`.
 - `apply` beside `sections`: added by `get_job_details` when the posting shows it was applied to or has closed. `{type}`, where `type` is `applied` or `closed`.
 

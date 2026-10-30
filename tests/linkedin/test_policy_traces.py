@@ -298,7 +298,14 @@ async def test_row_click_trace_reads_text_before_scanning_compose():
     )
     assert row_evaluation["kind"] == "evaluate"
     assert row_evaluation["program_digest"]
-    assert row_evaluation["arg"] == {"limit": 10, "nameFilter": None}
+    # The pause between opens comes from the rate limit, which the scenario
+    # runs with its shipped settings.
+    assert row_evaluation["arg"] == {
+        "limit": 10,
+        "nameFilter": None,
+        "pauseLowMs": 1500.0,
+        "pauseHighMs": 3000.0,
+    }
     assert trace["result"]["url"] == "https://www.linkedin.com/messaging/"
     assert trace["result"]["sections"] == {"inbox": "Conversation content"}
     assert trace["result"]["references"] == {

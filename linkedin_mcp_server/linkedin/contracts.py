@@ -68,8 +68,12 @@ def before_the_reply_deadline(
     return anyio.CancelScope(deadline=end, shield=shield)
 
 
-def rate_limited_section_error() -> dict[str, str]:
-    """The ``section_errors`` entry for a section that came back empty.
+def rate_limited_section_error(
+    message: str | None = None, *, retry_after: int | None = None
+) -> dict[str, Any]:
+    """The ``section_errors`` entry for a section the rate limit cut short.
+
+    Without arguments, the entry for a section that came back empty.
 
     One shape for every caller, because the alternative is what this codebase
     did until now: most call sites dropped the sentinel and returned the
@@ -81,11 +85,18 @@ def rate_limited_section_error() -> dict[str, str]:
     ``RATE_LIMITED_SECTION_TEXT`` above, and does not make it more accurate.
     What it changes is that a wrong verdict is now visible and can be argued
     with, where a silently missing section could not be.
+
+    *message* replaces the empty-section text when the pacing gate is what
+    held the section back, and *retry_after* says in seconds when it allows
+    more, as the error result of a refused call does.
     """
-    return {
+    error: dict[str, Any] = {
         "error_type": "rate_limit",
-        "error_message": RATE_LIMITED_SECTION_TEXT,
+        "error_message": message or RATE_LIMITED_SECTION_TEXT,
     }
+    if retry_after is not None:
+        error["retry_after"] = retry_after
+    return error
 
 
 class _Omitted:

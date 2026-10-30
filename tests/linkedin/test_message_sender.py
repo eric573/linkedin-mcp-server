@@ -1926,3 +1926,51 @@ class TestMessageConfirmation:
             _MESSAGE_CONFIRMATION_DISPOSE_JS,
             {"owner": owner, "token": "confirmation-token"},
         )
+
+
+class TestMessageLimit:
+    async def test_a_message_is_counted_before_its_submit_is_clicked(
+        self, mock_page, profile_dir
+    ):
+        """Counted whatever comes of the click.
+
+        From then on the call is never refused, or a stop could hide whether
+        the message left.
+        """
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+
+        gate = pacing.Pacing(RateLimitConfig(), profile_dir.parent / "rate-limit.json")
+        pacing.install_gate(gate)
+        sender = _sender(mock_page)
+        patches = TestSendMessage._patch_to_composer(sender, mock_page)
+        at_submit: dict[str, object] = {}
+
+        async def submit(message, *, target, owner):
+            scope = pacing._scope.get()
+            at_submit["counted"] = gate.status()["messages"]["last_24_hours"]
+            at_submit["submitted"] = scope is not None and scope.write_submitted
+            return "clicked"
+
+        with (
+            pacing.tool_call(deadline=None),
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
+            patch.object(
+                sender,
+                "_submit_verified_message",
+                new_callable=AsyncMock,
+                side_effect=submit,
+            ),
+            patches[8],
+            patches[9],
+            patches[10],
+        ):
+            result = await sender.send_message("testuser", "Hello!", confirm_send=True)
+
+        assert result["status"] == "sent"
+        assert at_submit == {"counted": 1, "submitted": True}

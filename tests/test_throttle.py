@@ -411,3 +411,42 @@ class TestTheRecordBelongsToOneCall:
 
         assert throttled_count() == 1
         assert seen["evidence"] is None
+
+
+class TestARefusalSlowsEverythingDown:
+    """Every LinkedIn 429 or 999 reaches the pacing gate, whoever sent it."""
+
+    @pytest.fixture
+    def gate(self, profile_dir):
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+
+        gate = pacing.Pacing(RateLimitConfig(), profile_dir.parent / "rate-limit.json")
+        pacing.install_gate(gate)
+        return gate
+
+    def test_a_refusal_answering_an_earlier_call_still_stops_requests(self, gate):
+        # Not this call's failure to explain, but LinkedIn asked for less all
+        # the same, and the page left open between calls is still talking.
+        listeners = handlers()
+        late = response(
+            429,
+            "https://www.linkedin.com/voyager/api/messaging/x",
+            headers={"retry-after": "1200"},
+        )
+        listeners["request"](late.request)
+
+        reset_throttle_record()
+        listeners["response"](late)
+
+        assert throttled_count() == 0
+        assert gate.stop_active()
+        assert gate.stop_seconds_left() == pytest.approx(1200, abs=1)
+
+    def test_linkedins_own_refusal_code_stops_requests_too(self, gate):
+        record(response(999, "https://www.linkedin.com/in/someone/"))
+        assert gate.status()["stop"]["reason"] == "http_999"
+
+    def test_another_hosts_refusal_stops_nothing(self, gate):
+        record(response(429, "https://proxy.example/blocked"))
+        assert not gate.stop_active()

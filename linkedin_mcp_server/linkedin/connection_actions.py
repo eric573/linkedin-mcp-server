@@ -32,6 +32,7 @@ import logging
 
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.destination import (
     linkedin_element,
     linkedin_handle,
@@ -652,6 +653,10 @@ class ConnectionActions:
                 await self._dismiss_dialog()
                 return False, False, None
 
+        # Counted before the click, whatever comes of it: a send that reads as
+        # failed may still have gone out. It also lets the profile re-read that
+        # confirms it through even if the limit or a stop would refuse it.
+        pacing.gate().record_write("invitation")
         sent = await self._click_dialog_primary_button()
         if not sent:
             # Fallback: focus the primary button positionally so a subsequent
@@ -935,6 +940,9 @@ class ConnectionActions:
                 profile=page_text,
             )
 
+        # Before the invite page, so an invitation over the limit costs no
+        # visit. Only here: accepting an incoming invitation sends none.
+        pacing.gate().check_write("invitation")
         await self._navigator._navigate_to_page(invite_url)
 
         submitted, note_sent, note_limit_message = await self._submit_invite_dialog(

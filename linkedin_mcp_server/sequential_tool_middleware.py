@@ -13,6 +13,7 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 
 from linkedin_mcp_server.config import get_config
+from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.daemon.liveness import (
     abandoned_before_browser_work,
     abandoned_call_error,
@@ -34,6 +35,10 @@ logger = logging.getLogger(__name__)
 #: anything else would drive the profile unserialized.
 _BROWSERLESS_TOOLS = frozenset({"get_session_status"})
 
+#: Tools that hold the browser without asking LinkedIn for anything. A rate
+#: limit stop never refuses them: closing the browser is what a stop wants.
+_NEVER_REACH_LINKEDIN = frozenset({"close_session"})
+
 
 class SequentialToolExecutionMiddleware(Middleware):
     """Ensure only one tool call at a time drives the shared LinkedIn browser.
@@ -49,15 +54,24 @@ class SequentialToolExecutionMiddleware(Middleware):
     the last one to close silently overwrites the other's cookies.
     """
 
-    def __init__(self, *, silent_owner: Unanswered | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        silent_owner: Unanswered | None = None,
+        tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
+    ) -> None:
         """*silent_owner* is the shared owner a Direct server fell back from.
 
         Its silence was seen once, at startup, so it explains only a lease wait
         that fails, and only until this process first gets the lease: after
         that, whoever holds the browser is not explained by it.
+
+        *tool_timeout* is what FastMCP cancels each tool after. The pacing gate
+        is told where that ends, so it never waits past it.
         """
         self._lock = asyncio.Lock()
         self._silent_owner = silent_owner
+        self._tool_timeout = tool_timeout
 
     async def _report_progress(
         self,
@@ -128,6 +142,7 @@ class SequentialToolExecutionMiddleware(Middleware):
         # Imported here so the module stays importable without the driver.
         # `core.throttle` needs no driver itself, but reaching it runs
         # `core/__init__`, which imports patchright.
+        from linkedin_mcp_server.core import pacing
         from linkedin_mcp_server.core.throttle import browser_call_record
         from linkedin_mcp_server.drivers.browser import (
             note_activity,
@@ -168,6 +183,20 @@ class SequentialToolExecutionMiddleware(Middleware):
             lease.release()
             logger.info("Tool '%s' was abandoned before it began", tool_name)
             raise abandoned_call_error()
+        # With the lease held, so the record read is the one every process
+        # writes under it. A call the gate would refuse at its first page is
+        # refused here instead, before it costs even a browser start.
+        gate = pacing.gate()
+        gate.refresh()
+        refusal = (
+            None if tool_name in _NEVER_REACH_LINKEDIN else gate.refusal_for_new_call()
+        )
+        if refusal is not None:
+            lease.release()
+            logger.info("Tool '%s' refused by the rate limit: %s", tool_name, refusal)
+            raise CodedToolError(
+                str(refusal), ErrorCode.RATE_LIMITED, retry_after=refusal.retry_after
+            )
         # From here on the call may act, so an owner that has to cut it off
         # reports its outcome as unknown rather than as a call that never ran.
         browser_work_begins()
@@ -181,7 +210,10 @@ class SequentialToolExecutionMiddleware(Middleware):
             # Evidence is per call: the throttled requests of the call before
             # this one would otherwise be offered as the diagnosis of a
             # failure they had nothing to do with.
-            with browser_call_record():
+            with (
+                browser_call_record(),
+                pacing.tool_call(deadline=time.monotonic() + self._tool_timeout),
+            ):
                 return await call_next(context)
         finally:
             hold_seconds = time.perf_counter() - hold_started

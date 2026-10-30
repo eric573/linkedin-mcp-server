@@ -57,6 +57,12 @@ def encode(config: AppConfig) -> dict[str, object]:
             for field in fields(config.browser)
         },
         "server": {name: getattr(config.server, name) for name in _SERVER_FIELDS},
+        # The owner is what paces LinkedIn, so it has to pace with the limits
+        # the user set rather than its own defaults.
+        "rate_limit": {
+            field.name: getattr(config.rate_limit, field.name)
+            for field in fields(config.rate_limit)
+        },
     }
 
 
@@ -71,6 +77,7 @@ def decode(payload: object) -> AppConfig:
     config = AppConfig()
     _apply(config.browser, payload.get("browser"), "browser")
     _apply(config.server, payload.get("server"), "server", allowed=_SERVER_FIELDS)
+    _apply(config.rate_limit, payload.get("rate_limit"), "rate_limit")
     # The same validation the frontend's own configuration went through. An
     # owner is the process that opens the browser, so a value that would be
     # refused there must be refused here rather than reaching Chromium by the

@@ -15,6 +15,7 @@ import anyio
 import anyio.lowlevel
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.destination import raise_if_off_linkedin
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
 import linkedin_mcp_server.linkedin.contracts as contracts
@@ -2070,7 +2071,9 @@ class MessageSender:
                         try:
                             # A click can dispatch before the evaluate call
                             # reports an error, so an exception from this
-                            # round trip is ambiguous.
+                            # round trip is ambiguous. Counted against the
+                            # message limit for the same reason.
+                            pacing.gate().record_write("message")
                             may_have_submitted = True
                             submission = await self._submit_verified_message(
                                 message,

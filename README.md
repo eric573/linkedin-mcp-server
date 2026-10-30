@@ -734,6 +734,47 @@ With a paid provider, use a sticky residential session that holds one address (n
 <br/>
 <br/>
 
+## Rate limiting
+
+Everything the server asks of LinkedIn draws on one budget for the whole account, whichever tool asks and whichever MCP client it came from:
+
+- A random 3-6 second pause before each page visit.
+- At most 60 page visits in any hour and 300 in any 24 hours. Opening a conversation counts as a visit, and every five scrolls or "Show more" clicks that load more items count as one. Scrolling a page that is already loaded is free.
+- At most 20 invitations a day and 100 a week, and 50 messages a day.
+- When LinkedIn pushes back (HTTP 429 or 999, its rate-limit page, or a page still empty after a retry), every request stops: as long as LinkedIn asks and at least 15 minutes, doubling for each repeat within a day. A checkpoint or CAPTCHA met during a tool call stops tool calls for 24 hours; signing in yourself is never blocked.
+
+A call that would have to wait more than 30 seconds, or longer than it has left, is refused with the `rate_limited` error code and `retry_after` in seconds, and keeps any pages it already read. `get_session_status` shows what is spent and when the next visit is allowed, without opening the browser. LinkedIn publishes none of its limits, so these are cautious guesses, and every one is a setting.
+
+### Setup Help
+
+<details>
+<summary><b>🔧 Configuration</b></summary>
+
+All optional; `0` turns a limit off. See [`.env.example`](.env.example) for the full descriptions.
+
+- `RATE_LIMIT_PAUSE_SECONDS` - pause before each page visit, one number or a range (default `3-6`)
+- `RATE_LIMIT_VISITS_PER_HOUR` / `RATE_LIMIT_VISITS_PER_DAY` (defaults `60` / `300`)
+- `RATE_LIMIT_INVITES_PER_DAY` / `RATE_LIMIT_INVITES_PER_WEEK` (defaults `20` / `100`)
+- `RATE_LIMIT_MESSAGES_PER_DAY` (default `50`)
+- `RATE_LIMIT_SEARCH_PAGES_PER_MONTH` - people-search pages per calendar month, for a free account that meets LinkedIn's monthly search limit (default `0`, off)
+- `RATE_LIMIT_STOP_MINUTES`, `RATE_LIMIT_EMPTY_PAGE_STOP_MINUTES`, `RATE_LIMIT_CHALLENGE_STOP_HOURS` - how long requests stop when LinkedIn pushes back (defaults `15`, `5`, `24`)
+
+What has been spent is kept in `rate-limit.json` next to your saved session, so restarts do not reset it and every server process sharing the session spends one budget. To reset it, stop the server and delete the file.
+
+</details>
+
+<details>
+<summary><b>❗ What the limit cannot see</b></summary>
+
+- Your own use of LinkedIn in a browser, a second copy of the server on another machine, or Docker and the host running at once against the same account. All of it counts toward LinkedIn's limits. Run one server per account, and lower the limits if you also browse a lot by hand.
+- A full profile with every section is twelve page visits, and `get_inbox` opens each conversation it lists to read its link, so `limit=20` costs about 22. Ask for what you need.
+- On a Linux server, use the Docker image. Outside Docker, Chromium runs in headless mode there and identifies itself as `HeadlessChrome` on every surface, which is a far louder signal than any request rate.
+
+</details>
+
+<br/>
+<br/>
+
 ## Setup from Source (Develop & Contribute)
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.github/CONTRIBUTING.md) for architecture guidelines and checklists. Search existing issues first, then use the [issue forms](https://github.com/stickerdaniel/linkedin-mcp-server/issues/new/choose) for anything new. AI agents follow the [issue-packet skill](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.agents/skills/issue-packet/SKILL.md).
@@ -923,7 +964,7 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 > This tool controls a real browser session; it doesn't exploit undocumented APIs or bypass authentication. LinkedIn's User Agreement prohibits automated access, and accounts using automated tools can be restricted or banned. Use at your own risk; there is no guarantee of account safety. If you encounter any issues, let me know in the [Discussions](https://github.com/stickerdaniel/linkedin-mcp-server/discussions).
 >
 > **What if my agents execute too many actions?**
-> Tool calls run sequentially through a queue. You are responsible for the volume of automation you run; use it sparingly and prompt your agents responsibly.
+> Tool calls run sequentially through a queue, and the server paces and caps everything it asks of LinkedIn (see [Rate limiting](#rate-limiting)). Those limits are cautious guesses, not guarantees: you are still responsible for the volume of automation you run, so use it sparingly and prompt your agents responsibly.
 
 ## Contributors
 

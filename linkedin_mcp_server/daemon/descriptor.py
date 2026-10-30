@@ -28,7 +28,7 @@ import stat
 import unicodedata
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -592,6 +592,12 @@ def config_fingerprint(config: AppConfig, *, key: str) -> str:
         for name in SHARED_CONFIG_FIELDS
     }
     material["tool_timeout_seconds"] = config.server.tool_timeout_seconds
+    # Every pacing limit, because the owner enforces them for each client it
+    # serves: a client with its own limits would otherwise be paced by another's.
+    material["rate_limit"] = {
+        setting.name: getattr(config.rate_limit, setting.name)
+        for setting in fields(config.rate_limit)
+    }
     return hmac.new(
         key.encode("utf-8"), _canonical(material).encode("utf-8"), hashlib.sha256
     ).hexdigest()

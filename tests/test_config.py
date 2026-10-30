@@ -1279,3 +1279,143 @@ class TestProxyEncodedUserinfo:
         config = BrowserConfig(proxy_server="http://gate.example:7000")
         config.validate()
         assert config.proxy_server == "http://gate.example:7000"
+
+
+class TestRateLimitConfig:
+    """The pacing limits: one budget, read from the environment, 0 turns one off."""
+
+    def test_shipped_defaults_are_valid_and_leave_the_search_cap_off(self):
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+
+        config = RateLimitConfig()
+        config.validate()
+
+        assert (config.pause_min_seconds, config.pause_max_seconds) == (3.0, 6.0)
+        assert (config.visits_per_hour, config.visits_per_day) == (60, 300)
+        assert (config.invites_per_day, config.invites_per_week) == (20, 100)
+        assert config.messages_per_day == 50
+        # Only a free account meets LinkedIn's monthly search limit.
+        assert config.search_pages_per_month == 0
+
+    @pytest.mark.parametrize(
+        ("env_key", "attribute"),
+        [
+            ("RATE_LIMIT_VISITS_PER_HOUR", "visits_per_hour"),
+            ("RATE_LIMIT_VISITS_PER_DAY", "visits_per_day"),
+            ("RATE_LIMIT_INVITES_PER_DAY", "invites_per_day"),
+            ("RATE_LIMIT_INVITES_PER_WEEK", "invites_per_week"),
+            ("RATE_LIMIT_MESSAGES_PER_DAY", "messages_per_day"),
+            ("RATE_LIMIT_SEARCH_PAGES_PER_MONTH", "search_pages_per_month"),
+        ],
+    )
+    @pytest.mark.parametrize("raw", ["7", "0"])
+    def test_whole_number_limits_load_from_env(
+        self, monkeypatch, env_key, attribute, raw
+    ):
+        """0 has to survive the loader: it turns the limit off."""
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        monkeypatch.setenv(env_key, raw)
+        config = load_from_env(AppConfig())
+
+        assert getattr(config.rate_limit, attribute) == int(raw)
+        config.validate()
+
+    @pytest.mark.parametrize(
+        "env_key",
+        [
+            "RATE_LIMIT_VISITS_PER_HOUR",
+            "RATE_LIMIT_INVITES_PER_WEEK",
+            "RATE_LIMIT_SEARCH_PAGES_PER_MONTH",
+        ],
+    )
+    @pytest.mark.parametrize("bad_value", ["abc", "-1", "2.5"])
+    def test_a_bad_whole_number_limit_is_refused(self, monkeypatch, env_key, bad_value):
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        monkeypatch.setenv(env_key, bad_value)
+        with pytest.raises(ConfigurationError, match=f"Invalid {env_key}"):
+            load_from_env(AppConfig())
+
+    @pytest.mark.parametrize(
+        ("env_key", "attribute"),
+        [
+            ("RATE_LIMIT_STOP_MINUTES", "stop_minutes"),
+            ("RATE_LIMIT_EMPTY_PAGE_STOP_MINUTES", "empty_page_stop_minutes"),
+            ("RATE_LIMIT_CHALLENGE_STOP_HOURS", "challenge_stop_hours"),
+        ],
+    )
+    def test_stop_lengths_load_from_env(self, monkeypatch, env_key, attribute):
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        monkeypatch.setenv(env_key, "2.5")
+        assert getattr(load_from_env(AppConfig()).rate_limit, attribute) == 2.5
+
+    @pytest.mark.parametrize("bad_value", ["abc", "-1", "nan", "inf"])
+    def test_a_bad_stop_length_is_refused(self, monkeypatch, bad_value):
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        monkeypatch.setenv("RATE_LIMIT_STOP_MINUTES", bad_value)
+        with pytest.raises(ConfigurationError, match="Invalid RATE_LIMIT_STOP_MINUTES"):
+            load_from_env(AppConfig())
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("3-6", (3.0, 6.0)),
+            ("4", (4.0, 4.0)),
+            (" 1.5 - 2 ", (1.5, 2.0)),
+            ("0", (0.0, 0.0)),
+        ],
+    )
+    def test_the_pause_is_a_number_or_a_range(self, monkeypatch, raw, expected):
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        monkeypatch.setenv("RATE_LIMIT_PAUSE_SECONDS", raw)
+        config = load_from_env(AppConfig())
+
+        assert (
+            config.rate_limit.pause_min_seconds,
+            config.rate_limit.pause_max_seconds,
+        ) == expected
+
+    @pytest.mark.parametrize("bad_value", ["6-3", "abc", "-1", "3-", "3-x", "nan"])
+    def test_a_bad_pause_is_refused(self, monkeypatch, bad_value):
+        from linkedin_mcp_server.config.loaders import load_from_env
+
+        monkeypatch.setenv("RATE_LIMIT_PAUSE_SECONDS", bad_value)
+        with pytest.raises(
+            ConfigurationError, match="Invalid RATE_LIMIT_PAUSE_SECONDS"
+        ):
+            load_from_env(AppConfig())
+
+    @pytest.mark.parametrize(
+        ("attribute", "value"),
+        [
+            ("visits_per_day", -1),
+            ("visits_per_day", True),
+            ("messages_per_day", 2.0),
+            ("stop_minutes", -0.5),
+            ("pause_max_seconds", float("inf")),
+        ],
+    )
+    def test_validate_refuses_what_the_loader_would(self, attribute, value):
+        """The owner's copy arrives without the loader, so validate checks too."""
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+
+        config = RateLimitConfig()
+        setattr(config, attribute, value)
+        with pytest.raises(ConfigurationError, match=attribute):
+            config.validate()
+
+    def test_validate_refuses_a_backwards_pause_range(self):
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+
+        with pytest.raises(ConfigurationError, match="backwards"):
+            RateLimitConfig(pause_min_seconds=6.0, pause_max_seconds=3.0).validate()
+
+    def test_the_app_config_validates_its_rate_limits(self):
+        config = AppConfig()
+        config.rate_limit.visits_per_hour = -3
+        with pytest.raises(ConfigurationError, match="visits_per_hour"):
+            config.validate()

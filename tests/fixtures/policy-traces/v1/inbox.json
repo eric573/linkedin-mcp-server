@@ -98,7 +98,7 @@
       "call": "get_inbox",
       "kind": "sleep",
       "reason": "sleep",
-      "seconds": 0.5,
+      "seconds": 1.25,
       "section": "conversation"
     },
     {
@@ -111,6 +111,13 @@
       "kind": "evaluate",
       "operation": "root_content",
       "program_digest": "e6b2be4ebddd",
+      "section": "conversation"
+    },
+    {
+      "call": "get_inbox",
+      "kind": "sleep",
+      "reason": "sleep",
+      "seconds": 3.25,
       "section": "conversation"
     },
     {

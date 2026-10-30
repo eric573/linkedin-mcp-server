@@ -19,6 +19,7 @@ from linkedin_mcp_server.core import (
     AuthenticationError,
     BrowserManager,
     OffLinkedInLandingError,
+    RateLimitError,
     await_deferring_cancels,
     detect_auth_barrier_quick,
     detect_rate_limit,
@@ -33,6 +34,7 @@ from linkedin_mcp_server.core import (
     raise_if_proxy_error,
     resolve_remember_me_prompt,
 )
+from linkedin_mcp_server.core import pacing
 
 
 from linkedin_mcp_server.browser_launch import build_launch_options, describe_launch
@@ -210,6 +212,27 @@ async def _refuse_a_landing_off_linkedin(
     raise_if_off_linkedin(url)
 
 
+_FEED_URL = "https://www.linkedin.com/feed/"
+
+
+async def _open_feed(browser: BrowserManager) -> None:
+    """Open /feed/ through the pacing gate, like every other page visit.
+
+    Every browser start opens it to check the session, so it is a visit
+    LinkedIn counts like any other.
+    """
+    gate = pacing.gate()
+    await gate.before_visit(_FEED_URL)
+    try:
+        await goto_reporting_proxy_errors(
+            browser.page,
+            _FEED_URL,
+            wait_until="domcontentloaded",
+        )
+    finally:
+        gate.after_visit()
+
+
 async def _feed_auth_succeeds(
     browser: BrowserManager,
     *,
@@ -222,11 +245,7 @@ async def _feed_auth_succeeds(
             did not serve, which says nothing about the session.
     """
     try:
-        await goto_reporting_proxy_errors(
-            browser.page,
-            "https://www.linkedin.com/feed/",
-            wait_until="domcontentloaded",
-        )
+        await _open_feed(browser)
         await stabilize_navigation("feed navigation", logger)
         await record_page_trace(
             browser.page,
@@ -250,6 +269,7 @@ async def _feed_auth_succeeds(
         # verdict either way is only about LinkedIn while the page still is.
         await _refuse_a_landing_off_linkedin(browser, "feed-off-linkedin-settled")
         if barrier is not None:
+            pacing.note_auth_route(browser.page.url)
             await record_page_trace(
                 browser.page,
                 "feed-auth-barrier",
@@ -260,6 +280,10 @@ async def _feed_auth_succeeds(
         return True
     except OffLinkedInLandingError:
         # Also the recursive retries' refusal, which runs inside this try.
+        raise
+    except RateLimitError:
+        # The pacing gate refused the visit, which says nothing about the
+        # session; the False below would have the caller retire a valid login.
         raise
     except Exception as exc:
         # Before anything else: a proxy fault is not a dead session. Returning
@@ -292,6 +316,8 @@ async def _feed_auth_succeeds(
         await _refuse_a_landing_off_linkedin(
             browser, "feed-navigation-error-off-linkedin", hostless_too=False
         )
+        if barrier is not None:
+            pacing.note_auth_route(browser.page.url)
         detail = redact_proxy_credentials(f"{type(exc).__name__}: {exc}")
         await record_page_trace(
             browser.page,
@@ -465,11 +491,7 @@ async def validate_imported_cookies(cookie_path: Path, profile_dir: Path) -> boo
     )
     try:
         await browser.start()
-        await goto_reporting_proxy_errors(
-            browser.page,
-            "https://www.linkedin.com/feed/",
-            wait_until="domcontentloaded",
-        )
+        await _open_feed(browser)
         await stabilize_navigation("import pre-validate feed navigation", logger)
         if not await browser.import_cookies(cookie_path, preset_name="bridge_core"):
             accepted = False
@@ -533,11 +555,7 @@ async def _bridge_runtime_profile(
             "bridge-browser-started",
             extra={"profile_dir": str(profile_dir)},
         )
-        await goto_reporting_proxy_errors(
-            browser.page,
-            "https://www.linkedin.com/feed/",
-            wait_until="domcontentloaded",
-        )
+        await _open_feed(browser)
         await stabilize_navigation("pre-import feed navigation", logger)
         await record_page_trace(browser.page, "bridge-after-pre-import-feed")
         if not await browser.import_cookies(cookie_path):
@@ -1172,7 +1190,7 @@ async def watch_for_handoff_requests() -> None:
 
 
 async def release_profile_if_idle_or_requested() -> bool:
-    """Close the browser when another process wants it, or when we are idle.
+    """Close the browser on a handoff request, a rate limit stop, or idleness.
 
     Called after each tool call and from a background poller. Polling matters:
     if the owner only checked between calls, a waiter that announces *after* the
@@ -1190,6 +1208,16 @@ async def release_profile_if_idle_or_requested() -> bool:
     # hands over as soon as the call finishes.
     if _calls_in_flight > 0:
         return False
+
+    # A stop means LinkedIn asked for quiet, and the page left open would keep
+    # talking to it in the background until the idle timeout. The next call
+    # after the stop opens a fresh browser.
+    if pacing.gate().stop_active():
+        logger.info(
+            "Closing the browser for the rate limit stop (%.0fs left)",
+            pacing.gate().stop_seconds_left(),
+        )
+        return await _close_unless_a_call_arrived()
 
     config = get_config().browser
     # The lease this browser holds, not one the registry resolves now. Both

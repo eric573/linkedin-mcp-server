@@ -96,6 +96,13 @@
     },
     {
       "call": "send_message",
+      "kind": "sleep",
+      "reason": "sleep",
+      "seconds": 4.5,
+      "section": "message"
+    },
+    {
+      "call": "send_message",
       "callback_id": "callback-2",
       "event": "framenavigated",
       "kind": "listener.add",

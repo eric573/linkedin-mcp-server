@@ -7,11 +7,16 @@ failure is most likely throttling, but nothing read a response status, so the
 client was told nothing and the failure read as a parser bug.
 
 So every response's status is recorded by a listener installed on the page at
-browser start, and cleared as each tool call starts. The record is evidence
-only: it raises nothing and retries nothing, and a call that succeeds is
-untouched by it. `raise_tool_error` appends it to a failure that happened
-anyway. Classifying a refused navigation as a rate limit is a separate
-question, and is left to the navigation code.
+browser start, and cleared as each tool call starts. The record itself raises
+nothing and retries nothing, and a call that succeeds is untouched by it.
+`raise_tool_error` appends it to a failure that happened anyway. Classifying a
+refused navigation as a rate limit is a separate question, and is left to the
+navigation code.
+
+The one thing a refusal does change is the pace. Every one is handed to the
+pacing gate (`core/pacing.py`), which stops all LinkedIn requests for a while,
+whichever call sent it and whether or not a call was running: the page left
+open between calls keeps talking to LinkedIn too.
 
 Only the status, the URL and a numeric ``Retry-After`` are read. No body is
 read and nothing is sent.
@@ -37,6 +42,7 @@ from urllib.parse import urlsplit
 from weakref import WeakKeyDictionary, WeakSet
 
 from .destination import is_linkedin_landing
+from .pacing import note_linkedin_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -198,9 +204,16 @@ def _record(response: Any) -> None:
         url = str(response.url)
         # Another host's 429 is no word from LinkedIn: a proxy or captive
         # portal answering for it would be misreported as LinkedIn's wait.
-        if not is_linkedin_landing(url) or _sent_before_this_call(response):
+        if not is_linkedin_landing(url):
             return
-        hit = ThrottleHit(status=status, url=url, retry_after=_retry_after(response))
+        retry_after = _retry_after(response)
+        # Before the attribution below, which decides whose failure this
+        # explains. Pacing is about the account, not the call: LinkedIn asked
+        # for less either way.
+        note_linkedin_refusal(status, retry_after)
+        if _sent_before_this_call(response):
+            return
+        hit = ThrottleHit(status=status, url=url, retry_after=retry_after)
     except Exception:
         logger.debug("Could not read a response status", exc_info=True)
         return

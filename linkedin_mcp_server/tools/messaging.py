@@ -11,6 +11,7 @@ from fastmcp import Context, FastMCP
 from pydantic import Field
 
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.exceptions import (
     InvalidReferenceError,
 )
@@ -291,6 +292,10 @@ def register_messaging_tools(
         linkedin_username = normalize_person_identifier(linkedin_username)
         if profile_urn is not None:
             profile_urn = normalize_profile_urn(profile_urn)
+        if confirm_send:
+            # Before the browser: a message over the limit would otherwise
+            # cost the profile visit that leads up to it for nothing.
+            pacing.gate().check_write("message")
         extractor = await get_ready_extractor(ctx, tool_name="send_message")
         logger.info(
             "Sending message to %s (confirm_send=%s)",

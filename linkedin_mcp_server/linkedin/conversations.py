@@ -7,15 +7,18 @@ from typing import Any, Literal
 from urllib.parse import quote_plus
 
 import logging
+import math
 import re
 
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.exceptions import (
     InvalidReferenceError,
     LinkedInOperationError,
 )
 from linkedin_mcp_server.linkedin.content import PageContentReader
+from linkedin_mcp_server.linkedin.contracts import rate_limited_section_error
 from linkedin_mcp_server.linkedin.identifiers import (
     messaging_thread_url,
     normalize_person_identifier,
@@ -107,6 +110,9 @@ class _ThreadRefScan:
     first_index_gap: _IndexGap | None = None
     start_thread_id: str | None = None
     rows_available: bool = True
+    #: Rows the rate limit kept the scan from opening, and when it allows more.
+    held_back: int = 0
+    retry_after: int | None = None
 
 
 _BarrierReason = Literal["navigation", "missing_target", "name_rejected"]
@@ -172,12 +178,25 @@ def _conversation_rows_unavailable_error() -> dict[str, str]:
 
 def _listing_section_errors(
     section: str, scan: _ThreadRefScan, *, report_unavailable_rows: bool
-) -> dict[str, dict[str, str]] | None:
+) -> dict[str, Any] | None:
     if scan.stopped_at is not None:
         return {section: _thread_attribution_stopped_error(scan)}
     if report_unavailable_rows and not scan.rows_available:
         return {section: _conversation_rows_unavailable_error()}
+    if scan.held_back:
+        return {section: _conversations_held_back_error(scan)}
     return None
+
+
+def _conversations_held_back_error(scan: _ThreadRefScan) -> dict[str, Any]:
+    """The listing opened fewer conversations than asked, for the rate limit."""
+    return rate_limited_section_error(
+        f"Opened {len(scan.refs)} conversations to read their links and held "
+        f"back {scan.held_back} more to stay within the rate limit. Every "
+        "conversation is still named in the text; ask for fewer, or call "
+        "again later for the rest.",
+        retry_after=scan.retry_after,
+    )
 
 
 def _resolution_from_scan(display_name: str, scan: _ThreadRefScan) -> _ThreadResolution:
@@ -311,8 +330,13 @@ class ConversationReader:
         attempts: int,
         pause_time: float = 0.5,
     ) -> None:
-        """Scroll the largest scrollable region inside main when one exists."""
-        for _ in range(attempts):
+        """Scroll the largest scrollable region inside main when one exists.
+
+        Each scroll can load more conversations or older messages, so each is
+        counted and paced by the rate limit (`core/pacing.py`).
+        """
+        gate = pacing.gate()
+        for _ in range(gate.loads_allowed(attempts)):
             await self._session.run_on_linkedin(
                 """({ position }) => {
                     const main = document.querySelector('main');
@@ -335,7 +359,8 @@ class ConversationReader:
                 }""",
                 {"position": position},
             )
-            await self._session.delay(pause_time)
+            gate.record_loads(1)
+            await self._session.delay(gate.load_pause(pause_time))
 
     async def _extract_conversation_thread_refs(
         self,
@@ -407,13 +432,27 @@ class ConversationReader:
                 position="bottom", attempts=scroll_attempts, pause_time=0.5
             )
 
+        # Every click opens a thread, which LinkedIn loads like a page, so the
+        # rate limit counts each one as a visit and paces them apart. A listing
+        # is cut short to what the budget and the call's time allow, and says
+        # so. A name-filtered scan is not: it clicks only the named person's
+        # rows, and a shorter scan would renumber the threads `index` picks
+        # from, so it runs whole or is refused.
+        gate = pacing.gate()
+        allowed = gate.conversation_opens_allowed(limit)
+        if name_filter is not None:
+            if allowed == 0:
+                raise gate.opens_refusal()
+            allowed = limit
+        pause_low, pause_high = gate.conversation_pause_range()
+
         # The Ember click handler lives on an inner div; the <li> and <label>
         # don't trigger SPA navigation.  No role/aria attributes exist on the
         # clickable element, so class-name selectors are unavoidable here.
         # The aria-label value flows through unmodified — Python strips any
         # known locale prefix to derive a clean participant name for refs.
         outcome: dict[str, Any] = await self._session.run_on_linkedin(
-            """async ({ limit, nameFilter }) => {
+            """async ({ limit, nameFilter, pauseLowMs, pauseHighMs }) => {
                 const labels = Array.from(document.querySelectorAll(
                     'main li label[aria-label]'
                 ));
@@ -447,6 +486,7 @@ class ConversationReader:
                     stoppedAt: null,
                     firstIndexGap: null,
                     startThreadId: idOf(),
+                    rowCount: labels.length,
                 };
                 for (let position = 0; position < cap; position++) {
                     const label = labels[position];
@@ -468,6 +508,13 @@ class ConversationReader:
                             };
                         }
                         continue;
+                    }
+                    // The pause the rate limit asks for between opens, drawn
+                    // at random so the clicks keep no fixed rhythm.
+                    const pause = pauseLowMs
+                        + Math.random() * (pauseHighMs - pauseLowMs);
+                    if (pause > 0) {
+                        await new Promise(r => setTimeout(r, pause));
                     }
                     // Read fresh for every row: after an earlier row moved the
                     // page, the thread that was open at scan start is a real
@@ -497,8 +544,24 @@ class ConversationReader:
                 }
                 return outcome;
             }""",
-            {"limit": limit, "nameFilter": name_filter},
+            {
+                "limit": allowed,
+                "nameFilter": name_filter,
+                "pauseLowMs": pause_low * 1000,
+                "pauseHighMs": pause_high * 1000,
+            },
         )
+        # Every click, including one that never opened a thread: the request
+        # may have gone out all the same.
+        gate.record_conversation_opens(
+            len(outcome["rows"]) + (1 if outcome["stoppedAt"] is not None else 0)
+        )
+        wanted = outcome.get("rowCount", 0)
+        if limit is not None:
+            wanted = min(wanted, limit)
+        held_back = 0
+        if outcome["stoppedAt"] is None and allowed is not None:
+            held_back = max(0, wanted - allowed)
         refs: list[Reference] = []
         for conv in outcome["rows"]:
             ref: Reference = {
@@ -525,6 +588,12 @@ class ConversationReader:
                 else _IndexGap(gap["ariaLabel"], gap["position"], gap["precededBy"])
             ),
             start_thread_id=outcome["startThreadId"],
+            held_back=held_back,
+            retry_after=(
+                max(1, math.ceil(gate.seconds_until_next_visit()))
+                if held_back
+                else None
+            ),
         )
 
     async def _resolve_conversation_thread_urls(

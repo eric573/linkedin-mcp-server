@@ -28,6 +28,7 @@ def reset_singletons():
     from linkedin_mcp_server.bootstrap import reset_bootstrap_for_testing
     from linkedin_mcp_server.config import reset_config
     from linkedin_mcp_server.core.throttle import reset_throttle_record
+    from linkedin_mcp_server.core.pacing import reset_pacing_for_testing
     from linkedin_mcp_server.daemon.descriptor import (
         reset_daemon_descriptor_for_testing,
     )
@@ -53,6 +54,10 @@ def reset_singletons():
     # next test's failure otherwise: the record is process state, and the
     # middleware that clears it per call runs in almost none of these tests.
     reset_throttle_record()
+    # The process's gate otherwise paces every navigation a test drives at the
+    # real 3-6 seconds, and carries one test's visits and stops into the next.
+    # Tests about pacing install a gate of their own with a fake clock.
+    reset_pacing_for_testing()
     # Every test that builds a server records a role, and the auth gates read it
     # from process state. Left standing, one OWNER would refuse logins in every
     # test after it, in a suite where most never mention a role.
@@ -75,6 +80,7 @@ def reset_singletons():
     reset_leases_for_testing()
     reset_config()
     reset_throttle_record()
+    reset_pacing_for_testing()
     reset_process_role_for_testing()
     reset_liveness_for_testing()
     teardown_trace_logging(keep_traces=True)

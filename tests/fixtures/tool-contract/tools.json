@@ -560,7 +560,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Report local saved-session and serving-process state for requested diagnostics.\n\nReads local observations without opening a browser, starting setup or login,\nor contacting LinkedIn. Stored files do not prove current authentication.\nIn shared-browser mode these observations belong to the owner, not to a\nfrontend running a login. It answers during browser work without refreshing\nthe browser idle timer. Use ordinary LinkedIn tools directly for their\nrequested work rather than adding a status preflight.",
+    "description": "Report local saved-session and serving-process state for requested diagnostics.\n\nReads local observations without opening a browser, starting setup or login,\nor contacting LinkedIn. Stored files do not prove current authentication.\nIn shared-browser mode these observations belong to the owner, not to a\nfrontend running a login. It answers during browser work without refreshing\nthe browser idle timer. Use ordinary LinkedIn tools directly for their\nrequested work rather than adding a status preflight. The rate_limit\nblock says what the rate limit has spent, what is left, and any stop\nwith the time it ends; check it before planning a long run of calls.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},

@@ -9,6 +9,7 @@ from typing import Any
 
 from linkedin_mcp_server.bootstrap import _auth_ready, bootstrap_observation
 from linkedin_mcp_server.config import get_config
+from linkedin_mcp_server.core.pacing import status_on_disk
 from linkedin_mcp_server.drivers.browser import browser_activity
 from linkedin_mcp_server.server_role import process_role
 from linkedin_mcp_server.session_state import (
@@ -41,5 +42,8 @@ def session_status() -> dict[str, Any]:
             **browser_activity(),
             "idle_timeout_seconds": get_config().browser.browser_idle_timeout_seconds,
         },
+        # What the rate limit has spent and when it allows more, so a caller
+        # can plan a long crawl around it instead of running into a refusal.
+        "rate_limit": status_on_disk(),
         **bootstrap_observation(),
     }

@@ -7,6 +7,7 @@ from urllib.parse import quote_plus
 
 import logging
 
+from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
 from linkedin_mcp_server.linkedin.capture import (
@@ -25,7 +26,7 @@ from linkedin_mcp_server.linkedin.identifiers import (
 )
 from linkedin_mcp_server.linkedin.link_metadata import Reference
 from linkedin_mcp_server.linkedin.search_urls import build_company_search_url
-from linkedin_mcp_server.linkedin.session import NAV_DELAY, PageSession
+from linkedin_mcp_server.linkedin.session import PageSession
 
 if TYPE_CHECKING:
     from linkedin_mcp_server.callbacks import ProgressCallback
@@ -71,9 +72,6 @@ class CompanyReader:
 
         try:
             for i, spec in enumerate(requested_ordered):
-                if i > 0:
-                    await self._session.delay(NAV_DELAY)
-
                 section_name = spec.name
                 url = base_url + spec.suffix
                 try:
@@ -97,6 +95,17 @@ class CompanyReader:
                         rate_limited = True
                     elif extracted.error:
                         section_errors[section_name] = extracted.error
+                except PacingRefusedError as refused:
+                    # The rate limit refused this section's page, not the page
+                    # itself. What was read is kept, the rest is named with
+                    # when it can be had, and nothing read means the refusal
+                    # is the answer.
+                    if not sections:
+                        raise
+                    section_errors[section_name] = rate_limited_section_error(
+                        str(refused), retry_after=refused.retry_after
+                    )
+                    rate_limited = True
                 except LinkedInOperationError:
                     raise
                 except Exception as e:

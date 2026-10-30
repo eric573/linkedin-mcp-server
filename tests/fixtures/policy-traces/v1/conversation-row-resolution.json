@@ -98,7 +98,7 @@
       "call": "get_inbox",
       "kind": "sleep",
       "reason": "sleep",
-      "seconds": 0.5,
+      "seconds": 1.25,
       "section": "conversation"
     },
     {
@@ -111,6 +111,13 @@
       "kind": "evaluate",
       "operation": "root_content",
       "program_digest": "e6b2be4ebddd",
+      "section": "conversation"
+    },
+    {
+      "call": "get_inbox",
+      "kind": "sleep",
+      "reason": "sleep",
+      "seconds": 3.25,
       "section": "conversation"
     },
     {
@@ -203,18 +210,20 @@
       "call": "get_inbox",
       "kind": "sleep",
       "reason": "sleep",
-      "seconds": 0.5,
+      "seconds": 1.25,
       "section": "conversation"
     },
     {
       "arg": {
         "limit": 10,
-        "nameFilter": null
+        "nameFilter": null,
+        "pauseHighMs": 3000.0,
+        "pauseLowMs": 1500.0
       },
       "call": "get_inbox",
       "kind": "evaluate",
       "operation": "conversation_thread_refs",
-      "program_digest": "9ed788195c04",
+      "program_digest": "3ea1747cc5b1",
       "section": "conversation"
     }
   ],

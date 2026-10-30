@@ -657,3 +657,57 @@ async def test_authenticated_proxy_status_bypasses_browser_work_not_owner_admiss
         serving_owner.should_exit = True
         await asyncio.wait_for(serving, 10)
         listener.close()
+
+
+class TestRateLimitBlock:
+    """What the rate limit has spent, read from its record without the lease."""
+
+    @pytest.fixture
+    def record_path(self):
+        return get_source_profile_dir().parent / "rate-limit.json"
+
+    @staticmethod
+    def _gate(path):
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+
+        return pacing.Pacing(RateLimitConfig(), path)
+
+    async def test_another_processs_spending_and_stop_are_reported(
+        self, server, nothing_may_start, record_path
+    ):
+        from linkedin_mcp_server.core import pacing
+
+        # This process's gate has seen nothing; the record on disk is what
+        # another process wrote under the lease.
+        pacing.install_gate(self._gate(record_path))
+        writer = self._gate(record_path)
+        await writer.before_visit("https://www.linkedin.com/in/someone/")
+        writer.record_write("invitation")
+        writer.record_pushback("http_429")
+
+        status = await _status(server)
+
+        block = status["rate_limit"]
+        assert block["enabled"] is True
+        assert block["visits"]["last_hour"] == 1
+        assert block["invitations"]["last_24_hours"] == 1
+        assert block["stop"]["reason"] == "http_429"
+        assert 0 < block["stop"]["seconds_left"] <= 900
+
+    async def test_a_damaged_record_is_reported_and_left_for_the_lease_holder(
+        self, server, nothing_may_start, record_path
+    ):
+        from linkedin_mcp_server.core import pacing
+
+        pacing.install_gate(self._gate(record_path))
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text("{not json", encoding="utf-8")
+
+        status = await _status(server)
+
+        assert "unreadable" in status["rate_limit"]["record"]
+        assert record_path.read_text(encoding="utf-8") == "{not json"
+
+    async def test_with_pacing_switched_off_it_says_so(self, server, nothing_may_start):
+        assert (await _status(server))["rate_limit"] == {"enabled": False}

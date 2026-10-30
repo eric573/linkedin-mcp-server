@@ -2321,3 +2321,140 @@ class SectionCapture:
         return capture_plan_for_url(url)
 """
     assert _generic_capture_domain_path_literals(allowed) == set()
+
+
+class TestLoadsArePaced:
+    """A scroll or click that asks LinkedIn for more items is counted."""
+
+    URL = "https://www.linkedin.com/in/billgates/details/experience/"
+
+    @pytest.fixture
+    def gate(self, profile_dir):
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+
+        # The page visit itself, then one visit's worth left: five loads.
+        gate = pacing.Pacing(
+            RateLimitConfig(
+                visits_per_hour=2, pause_min_seconds=0, pause_max_seconds=0
+            ),
+            profile_dir.parent / "rate-limit.json",
+        )
+        pacing.install_gate(gate)
+        return gate
+
+    @staticmethod
+    def _boundaries(scroll=None):
+        return (
+            patch(
+                "linkedin_mcp_server.linkedin.session.scroll_to_bottom",
+                scroll or AsyncMock(return_value=0),
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        )
+
+    async def test_show_more_stops_when_the_budget_runs_out(self, mock_page, gate):
+        mock_page.evaluate = AsyncMock(
+            return_value={"source": "root", "text": "text", "references": []}
+        )
+        mock_page.wait_for_function = AsyncMock()
+        show_more = MagicMock()
+        show_more.count = AsyncMock(return_value=1)
+        show_more.is_visible = AsyncMock(return_value=True)
+        show_more.scroll_into_view_if_needed = AsyncMock()
+        show_more.click = AsyncMock()
+        show_more.first = show_more
+        held_in(show_more)
+        show_more.filter = MagicMock(return_value=show_more)
+        mock_page.locator = MagicMock(
+            side_effect=lambda selector: (
+                show_more
+                if selector == "main button"
+                else MagicMock(count=AsyncMock(return_value=0))
+            )
+        )
+        capture = _capture(mock_page)
+
+        scroll, rate, modal, sleep = self._boundaries()
+        with scroll, rate, modal, sleep:
+            await capture._capture_once(
+                self.URL,
+                section_name="experience",
+                plan=CapturePlan(CaptureMode.DETAILS, max_scrolls=20),
+            )
+
+        assert show_more.click.await_count == 5
+        assert gate.loads_allowed(1) == 0
+
+    @pytest.mark.parametrize(
+        ("url", "mode"),
+        [
+            (
+                "https://www.linkedin.com/in/billgates/recent-activity/all/",
+                CaptureMode.ACTIVITY,
+            ),
+            (
+                "https://www.linkedin.com/search/results/content/?keywords=x",
+                CaptureMode.SEARCH_RESULTS | CaptureMode.POST_PERMALINKS,
+            ),
+        ],
+        ids=("activity", "post-search"),
+    )
+    async def test_an_endless_list_scrolls_only_as_far_as_the_budget_allows(
+        self, mock_page, gate, url, mode
+    ):
+        mock_page.evaluate = AsyncMock(
+            return_value={"source": "root", "text": "Posts", "references": []}
+        )
+        mock_page.wait_for_function = AsyncMock()
+        scroll = AsyncMock(return_value=5)
+        capture = _capture(mock_page)
+
+        boundaries = self._boundaries(scroll)
+        with boundaries[0], boundaries[1], boundaries[2], boundaries[3]:
+            await capture._capture_once(
+                url,
+                section_name="posts",
+                plan=CapturePlan(mode, max_scrolls=20),
+            )
+
+        scrolled = scroll.await_args
+        assert scrolled is not None
+        assert scrolled.kwargs["max_scrolls"] == 5
+        # A second apart at least, stretched at random, whatever the list's own
+        # pause: post search asks for half a second.
+        assert 1.0 <= scrolled.kwargs["pause_time"] <= 1.5
+        assert gate.loads_allowed(1) == 0
+
+    async def test_scrolling_a_page_already_loaded_costs_nothing(self, mock_page, gate):
+        mock_page.evaluate = AsyncMock(
+            return_value={"source": "root", "text": "Profile", "references": []}
+        )
+        mock_page.wait_for_function = AsyncMock()
+        scroll = AsyncMock(return_value=5)
+        capture = _capture(mock_page)
+
+        boundaries = self._boundaries(scroll)
+        with boundaries[0], boundaries[1], boundaries[2], boundaries[3]:
+            await capture._capture_once(
+                "https://www.linkedin.com/in/billgates/",
+                section_name="main_profile",
+                plan=CapturePlan(),
+            )
+
+        scrolled = scroll.await_args
+        assert scrolled is not None
+        assert scrolled.kwargs == {"pause_time": 0.5, "max_scrolls": 5}
+        assert gate.loads_allowed(5) == 5

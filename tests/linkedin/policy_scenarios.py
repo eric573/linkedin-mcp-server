@@ -12,11 +12,14 @@ from unittest.mock import patch
 import asyncio
 import inspect
 import json
+import random
 
 from patchright.async_api import Page
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.callbacks import ProgressCallback
+from linkedin_mcp_server.config.schema import RateLimitConfig
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.linkedin import capture as capture_module
 from linkedin_mcp_server.linkedin import company as company_module
 from linkedin_mcp_server.linkedin import feed as feed_module
@@ -124,6 +127,30 @@ def _diagnostics_bindings(diagnostics: Any) -> Iterator[None]:
         yield
 
 
+class _MidpointRandom(random.Random):
+    """Every random draw lands in the middle of its range."""
+
+    def uniform(self, a: float, b: float) -> float:
+        return (a + b) / 2
+
+
+def _scenario_gate(clock: FakeClock) -> pacing.Pacing:
+    """The pacing gate with the shipped limits, on the scenario's own clock.
+
+    Its draws are pinned to the middle of each range, so the pauses it adds
+    are in the trace, the same on every run, wherever production would pause.
+    In memory only: a scenario never writes a record anywhere.
+    """
+    return pacing.Pacing(
+        RateLimitConfig(),
+        None,
+        clock=pacing.Clock(
+            wall=clock.monotonic, monotonic=clock.monotonic, sleep=clock.sleep
+        ),
+        rng=_MidpointRandom(),
+    )
+
+
 @asynccontextmanager
 async def boundaries(
     recorder: TraceRecorder,
@@ -223,6 +250,9 @@ async def boundaries(
         ),
         patch.object(session_module.asyncio, "sleep", clock.sleep),
         patch.object(session_module.time, "monotonic", clock.monotonic),
+        # Patched rather than installed, so the checker script, which runs
+        # outside pytest, never builds the real gate and its record file.
+        patch.object(pacing, "_gate", _scenario_gate(clock)),
     ):
         yield
 

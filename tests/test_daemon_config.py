@@ -193,6 +193,41 @@ class TestRoundTrip:
 
         assert restored.server.tool_timeout_seconds == 42.5
 
+    def test_every_rate_limit_crosses_because_the_owner_paces_linkedin(self):
+        # The owner is the process that opens pages, so an owner left on the
+        # default limits would pace a user who lowered them at the defaults.
+        original = AppConfig()
+        original.browser.user_data_dir = "~/p/profile"
+        original.rate_limit.pause_min_seconds = 5.0
+        original.rate_limit.pause_max_seconds = 9.0
+        original.rate_limit.visits_per_hour = 12
+        original.rate_limit.visits_per_day = 40
+        original.rate_limit.invites_per_day = 3
+        original.rate_limit.invites_per_week = 9
+        original.rate_limit.messages_per_day = 4
+        original.rate_limit.search_pages_per_month = 70
+        original.rate_limit.stop_minutes = 30.0
+        original.rate_limit.empty_page_stop_minutes = 8.0
+        original.rate_limit.challenge_stop_hours = 48.0
+
+        carried = daemon_config.encode(original)
+        restored = daemon_config.decode(carried)
+
+        assert restored.rate_limit == original.rate_limit
+        assert set(cast(dict[str, object], carried["rate_limit"])) == {
+            field.name for field in fields(original.rate_limit)
+        }
+
+    def test_a_client_with_other_rate_limits_is_not_served_by_this_owner(self):
+        # The owner enforces its own limits for every client it serves, so a
+        # client that asked for fewer visits must not attach to it.
+        mine = _config()
+        theirs = _config()
+        theirs.rate_limit.visits_per_hour = 10
+
+        key = "a-token"
+        assert config_fingerprint(mine, key=key) != config_fingerprint(theirs, key=key)
+
 
 @pytest.fixture
 def owner_streams(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
@@ -473,14 +508,14 @@ class TestRefusing:
         # The other direction, and it has to work: JSON writes 0 for 0.0, so
         # refusing would make an ordinary configuration untransportable.
         restored = daemon_config.decode(
-            {"browser": {"login_timeout_seconds": 0}, "server": {}}
+            {"browser": {"login_timeout_seconds": 0}, "server": {}, "rate_limit": {}}
         )
 
         assert restored.browser.login_timeout_seconds == 0
 
     def test_an_optional_setting_may_be_unset(self):
         restored = daemon_config.decode(
-            {"browser": {"chrome_path": None}, "server": {}}
+            {"browser": {"chrome_path": None}, "server": {}, "rate_limit": {}}
         )
 
         assert restored.browser.chrome_path is None
@@ -500,7 +535,11 @@ class TestRefusing:
 
         with pytest.raises(ConfigurationError, match="tool_timeout_seconds"):
             daemon_config.decode(
-                {"browser": {}, "server": {"tool_timeout_seconds": -1.0}}
+                {
+                    "browser": {},
+                    "server": {"tool_timeout_seconds": -1.0},
+                    "rate_limit": {},
+                }
             )
 
     def test_the_owner_applies_the_browser_mode_it_was_handed(
@@ -971,3 +1010,20 @@ class TestRefusing:
 
         with pytest.raises(ValueError, match="no browser section"):
             daemon_config.decode({"server": {}})
+
+
+class TestRateLimitSection:
+    def test_a_payload_without_rate_limits_is_refused(self):
+        # Both ends are one build, so a missing section means the payload did
+        # not come from `encode`, and an owner that filled in defaults would
+        # pace LinkedIn at limits nobody chose.
+        with pytest.raises(ValueError, match="rate_limit"):
+            daemon_config.decode({"browser": {}, "server": {}})
+
+    def test_a_rate_limit_the_frontend_would_reject_is_rejected_here_too(self):
+        from linkedin_mcp_server.config.schema import ConfigurationError
+
+        with pytest.raises(ConfigurationError, match="visits_per_hour"):
+            daemon_config.decode(
+                {"browser": {}, "server": {}, "rate_limit": {"visits_per_hour": -1}}
+            )

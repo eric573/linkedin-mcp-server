@@ -7,6 +7,7 @@ to handle.
 """
 
 import logging
+import math
 from enum import StrEnum
 from typing import Any, NoReturn
 
@@ -50,6 +51,8 @@ from linkedin_mcp_server.exceptions import (
     OwnerCannotAuthenticateError,
     SessionExpiredError,
 )
+from linkedin_mcp_server.core import pacing
+from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.core.throttle import throttle_evidence
 from linkedin_mcp_server.session_state import PeerSessionInPlaceError
 from linkedin_mcp_server.error_diagnostics import (
@@ -410,10 +413,23 @@ def _shape_tool_error(exception: Exception, context: str = "") -> NoReturn:
         )
 
     elif isinstance(exception, RateLimitError):
-        wait_time = getattr(exception, "suggested_wait_time", 300)
+        if isinstance(exception, PacingRefusedError):
+            # The gate's refusal already names the limit and when it lifts.
+            message = str(exception)
+            wait_time = exception.retry_after
+        else:
+            # LinkedIn's own rate-limit page, which has started a stop by now.
+            # Its end is the honest wait, not the page's own suggestion.
+            wait_time = max(
+                getattr(exception, "suggested_wait_time", 300),
+                math.ceil(pacing.gate().stop_seconds_left()),
+            )
+            message = (
+                f"Rate limit detected. Wait {wait_time} seconds before trying again."
+            )
         logger.warning("Rate limit%s: %s (wait=%ds)", ctx, exception, wait_time)
         raise CodedToolError(
-            f"Rate limit detected. Wait {wait_time} seconds before trying again.",
+            message,
             ErrorCode.RATE_LIMITED,
             retry_after=wait_time,
         ) from exception

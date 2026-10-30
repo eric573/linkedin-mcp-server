@@ -547,9 +547,13 @@ class TestReadPersonUrls:
 
 
 class TestReadPersonPacing:
-    """The person-section walk paces gaps rather than individual captures."""
+    """The section walk never pauses on its own.
 
-    async def test_selected_sections_are_paced_in_config_order(self, mock_page):
+    The pacing gate pauses every navigation (`core/pacing.py`); a pause here
+    as well would pace each page twice. The recorded delays prove there is none.
+    """
+
+    async def test_selected_sections_are_read_in_config_order(self, mock_page):
         reader = _reader(mock_page)
         events = []
 
@@ -575,9 +579,7 @@ class TestReadPersonPacing:
 
         assert events == [
             ("capture", "main_profile"),
-            ("delay", 2.0),
             ("capture", "experience"),
-            ("delay", 2.0),
             ("capture", "contact_info"),
         ]
 
@@ -586,7 +588,7 @@ class TestReadPersonPacing:
         [{"main_profile"}, {"not_a_person_section"}],
         ids=["one-section", "no-recognized-section"],
     )
-    async def test_a_single_selected_section_has_no_gap(self, mock_page, requested):
+    async def test_a_single_selected_section_is_one_capture(self, mock_page, requested):
         reader = _reader(mock_page)
         events = []
 
@@ -605,7 +607,7 @@ class TestReadPersonPacing:
 
         assert events == [("capture", "main_profile")]
 
-    async def test_rate_limit_stops_before_later_capture_and_gap(self, mock_page):
+    async def test_rate_limit_stops_before_later_capture(self, mock_page):
         reader = _reader(mock_page)
         events = []
 
@@ -628,15 +630,12 @@ class TestReadPersonPacing:
 
         assert events == [
             ("capture", "main_profile"),
-            ("delay", 2.0),
             ("capture", "experience"),
         ]
         assert result["sections"] == {"main_profile": "main_profile text"}
         assert result["section_errors"]["experience"]["error_type"] == "rate_limit"
 
-    async def test_reused_main_profile_leaves_one_gap_before_next_section(
-        self, mock_page
-    ):
+    async def test_reused_main_profile_is_read_without_navigating(self, mock_page):
         reader = _reader(mock_page)
         mock_page.url = "https://www.linkedin.com/in/testuser/"
         events = []
@@ -668,7 +667,6 @@ class TestReadPersonPacing:
 
         assert events == [
             ("reuse", "main_profile"),
-            ("delay", 2.0),
             ("capture", "experience"),
         ]
         navigate.assert_not_awaited()
@@ -1018,9 +1016,7 @@ class TestMissingContactOverlay:
 
         assert events == [
             ("goto", f"{base}/"),
-            ("delay", 2.0),
             ("goto", overlay),
-            ("delay", 2.0),
             ("goto", posts),
         ]
         assert result["sections"] == {
@@ -1052,7 +1048,6 @@ class TestMissingContactOverlay:
 
         assert events == [
             ("goto", f"{base}/"),
-            ("delay", 2.0),
             ("goto", overlay),
             ("delay", 5.0),
             ("goto", overlay),
@@ -1079,7 +1074,7 @@ class TestMissingContactOverlay:
         with self.browser(reader, mock_page, pages, events, redirects={me: profile}):
             result = await reader.get_my_profile(sections={"contact_info"})
 
-        assert events == [("goto", me), ("delay", 2.0), ("goto", overlay)]
+        assert events == [("goto", me), ("goto", overlay)]
         assert result["url"] == profile
         assert result["sections"] == {"main_profile": PROFILE_TEXT}
         assert result["section_errors"] == {"contact_info": _missing_root(overlay)}
@@ -1437,9 +1432,7 @@ class TestGetSidebarProfiles:
         assert result["sidebar_profiles"]["explore_premium_profiles"] == ["/in/carol/"]
         assert result["sidebar_profiles"]["people_you_may_know"] == ["/in/dave/"]
 
-    async def test_two_show_all_navigations_have_one_gap_before_the_second(
-        self, mock_page
-    ):
+    async def test_two_show_all_navigations_follow_in_order(self, mock_page):
         first_url = "https://www.linkedin.com/search/results/people/?keywords=first"
         second_url = "https://www.linkedin.com/search/results/people/?keywords=second"
         sidebar_data = {
@@ -1477,7 +1470,6 @@ class TestGetSidebarProfiles:
         assert events == [
             ("navigate", "https://www.linkedin.com/in/testuser/"),
             ("navigate", first_url),
-            ("delay", 2.0),
             ("navigate", second_url),
         ]
 
@@ -1524,7 +1516,7 @@ class TestGetSidebarProfiles:
         ]
 
     @pytest.mark.parametrize("first_outcome", ["failure", "premium-redirect"])
-    async def test_unsuccessful_show_all_attempt_paces_the_next_one(
+    async def test_unsuccessful_show_all_attempt_does_not_stop_the_next_one(
         self, mock_page, first_outcome
     ):
         first_url = "https://www.linkedin.com/search/results/people/?keywords=first"
@@ -1567,7 +1559,6 @@ class TestGetSidebarProfiles:
         assert events == [
             ("navigate", "https://www.linkedin.com/in/testuser/"),
             ("navigate", first_url),
-            ("delay", 2.0),
             ("navigate", second_url),
         ]
 
@@ -1970,3 +1961,87 @@ class TestSearchPeople:
         assert "geoUrn=%5B%22103644278%22%5D" in result["url"]
         assert "network=%5B%22F%22%5D" in result["url"]
         assert "currentCompany=%5B%221115%22%5D" in result["url"]
+
+
+class TestARateLimitRefusalMidWalk:
+    """The pacing gate refusing a later section keeps what was read."""
+
+    @staticmethod
+    def _refused():
+        from linkedin_mcp_server.core.pacing import PacingRefusedError
+
+        return PacingRefusedError("Rate limit: 60 of the 60 page visits ...", 120)
+
+    async def test_the_sections_read_before_it_are_kept(self, mock_page):
+        reader = _reader(mock_page)
+        capture = AsyncMock(side_effect=[extracted("profile text"), self._refused()])
+
+        with (
+            patch.object(reader._capture, "capture", capture),
+            patch.object(
+                reader._profile_page,
+                "_extract_profile_urn",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            result = await reader.read_person(
+                "testuser", {"main_profile", "experience", "education"}
+            )
+
+        assert result["sections"] == {"main_profile": "profile text"}
+        error = result["section_errors"]["experience"]
+        assert error["error_type"] == "rate_limit"
+        assert error["retry_after"] == 120
+        assert "60 page visits" in error["error_message"]
+        # Stopped there: education was never asked for.
+        assert capture.await_count == 2
+
+    async def test_a_refusal_before_anything_is_read_is_the_answer(self, mock_page):
+        from linkedin_mcp_server.core.pacing import PacingRefusedError
+
+        reader = _reader(mock_page)
+        with (
+            patch.object(
+                reader._capture, "capture", AsyncMock(side_effect=self._refused())
+            ),
+            pytest.raises(PacingRefusedError),
+        ):
+            await reader.read_person("testuser", {"main_profile", "experience"})
+
+    async def test_a_refused_show_all_keeps_the_sidebar_already_read(self, mock_page):
+        first_url = "https://www.linkedin.com/search/results/people/?keywords=first"
+        second_url = "https://www.linkedin.com/search/results/people/?keywords=second"
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "sections": {"first": ["/in/alice/"], "second": ["/in/bob/"]},
+                "showAllUrls": {"first": first_url, "second": second_url},
+            }
+        )
+        visited = []
+
+        async def navigate(url):
+            if url == first_url:
+                raise self._refused()
+            visited.append(url)
+
+        reader = _reader(mock_page)
+        with (
+            patch.object(reader._navigator, "_navigate_to_page", side_effect=navigate),
+            patch(
+                "linkedin_mcp_server.linkedin.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.linkedin.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            result = await reader.get_sidebar_profiles("testuser")
+
+        assert visited == ["https://www.linkedin.com/in/testuser/"]
+        assert result["sidebar_profiles"] == {
+            "first": ["/in/alice/"],
+            "second": ["/in/bob/"],
+        }
+        assert result["section_errors"]["sidebar_profiles"]["retry_after"] == 120

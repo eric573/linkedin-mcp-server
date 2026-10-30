@@ -1335,3 +1335,55 @@ class TestTheMainTextWaitAgainstRealDom:
             )
 
         assert "Messaging inbox content did not appear" in caplog.text
+
+
+class TestTheClickLoopIsPaced:
+    """The rate limit's pause between opens, run in a real page."""
+
+    @pytest.fixture
+    def gate(self, monkeypatch, profile_dir):
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+
+        # Short enough for a test, long enough that timer slack cannot fake it.
+        monkeypatch.setattr(pacing, "CONVERSATION_PAUSE_SECONDS", (0.2, 0.2))
+        gate = pacing.Pacing(
+            RateLimitConfig(visits_per_hour=2, visits_per_day=0),
+            profile_dir.parent / "rate-limit.json",
+        )
+        pacing.install_gate(gate)
+        return gate
+
+    async def test_opens_are_spaced_and_stop_where_the_budget_does(
+        self, dom_page, gate
+    ):
+        await serve(
+            dom_page,
+            sidebar(
+                [
+                    ("Select conversation with Ada Lovelace", "2-ada"),
+                    ("Select conversation with Grace Hopper", "2-grace"),
+                    ("Select conversation with Alan Turing", "2-alan"),
+                ]
+            ),
+        )
+        await dom_page.evaluate(
+            """() => {
+                globalThis.linkedinMcpClickTimes = [performance.now()];
+                document.addEventListener(
+                    'click',
+                    () => globalThis.linkedinMcpClickTimes.push(performance.now()),
+                    true,
+                );
+            }"""
+        )
+
+        outcome = await scan(dom_page, limit=3)
+
+        # Two opens are what the budget holds; the third row is held back.
+        assert await clicks(dom_page) == ["2-ada", "2-grace"]
+        assert outcome.held_back == 1
+        times = await dom_page.evaluate("() => globalThis.linkedinMcpClickTimes")
+        gaps = [later - earlier for earlier, later in zip(times, times[1:])]
+        assert len(gaps) == 2
+        assert all(gap >= 180 for gap in gaps)

@@ -24,6 +24,7 @@ A Model Context Protocol (MCP) server that connects AI assistants to LinkedIn. A
 - **Post Search**: Search posts/content globally by keyword (the "Posts" tab) with optional recency and content-type filters, such as uploaded documents
 - **Compact References**: Return typed per-section links alongside readable text without shipping full-page markdown
 - **Session Status**: Diagnose saved-session files and the serving process's browser state without opening a browser or contacting LinkedIn
+- **Rate Limiting**: One budget for everything the server asks of LinkedIn: paced page visits, hourly and daily caps, invitation and message caps, and a stop whenever LinkedIn pushes back
 
 ## Quick Start
 
@@ -133,6 +134,12 @@ Use `$env:USERPROFILE\.linkedin-mcp` when constructing the host path outside JSO
 | `BROWSER_MIN_HOLD` | `20` | Shortest time a process keeps the shared browser before handing it over, in seconds. Clamped to 3 seconds below `BROWSER_WAIT`, so raise that one along with it. Higher means fewer browser restarts but longer waits for other clients. |
 | `BROWSER_IDLE_TIMEOUT` | `600` | Close an idle browser and release the profile after this many seconds without a tool call (`0` = keep it open). |
 | `AUTO_IMPORT_FROM_BROWSER` | on | Import a session from a signed-in local browser on the first tool call that needs one. Skipped in containers, which have no host browser or keychain. |
+| `RATE_LIMIT_PAUSE_SECONDS` | `3-6` | Pause before each LinkedIn page visit, in seconds: one number or a range drawn from at random. One budget covers every tool; details under [Rate limiting](https://github.com/stickerdaniel/linkedin-mcp-server#rate-limiting). |
+| `RATE_LIMIT_VISITS_PER_HOUR` / `RATE_LIMIT_VISITS_PER_DAY` | `60` / `300` | Page visits in any hour / any 24 hours. Opening a conversation counts as one, and five scrolls that load more count as one. `0` turns a limit off. |
+| `RATE_LIMIT_INVITES_PER_DAY` / `RATE_LIMIT_INVITES_PER_WEEK` | `20` / `100` | Connection invitations sent, counted at the click. |
+| `RATE_LIMIT_MESSAGES_PER_DAY` | `50` | Messages sent. |
+| `RATE_LIMIT_SEARCH_PAGES_PER_MONTH` | `0` | People-search pages per calendar month, for a free account; `0` is off. |
+| `RATE_LIMIT_STOP_MINUTES` | `15` | How long every request stops after an HTTP 429 or 999 or a rate-limit page, doubled for each repeat within a day. `RATE_LIMIT_EMPTY_PAGE_STOP_MINUTES` (`5`) and `RATE_LIMIT_CHALLENGE_STOP_HOURS` (`24`) set the stops after an empty page and a checkpoint. |
 | `TRANSPORT` | `stdio` | Transport mode: stdio, streamable-http |
 | `HOST` | `127.0.0.1` | HTTP server host (for streamable-http transport) |
 | `PORT` | `8000` | HTTP server port (for streamable-http transport) |

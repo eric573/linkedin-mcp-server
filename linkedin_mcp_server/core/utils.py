@@ -15,6 +15,7 @@ from patchright.async_api import (
 from .auth import raise_if_auth_route
 from .destination import linkedin_element
 from .exceptions import OffLinkedInLandingError, RateLimitError
+from .pacing import note_slow_down_page
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +315,7 @@ async def detect_rate_limit(page: Page) -> None:
                     "try again later",
                 ]
             ):
+                note_slow_down_page()
                 raise RateLimitError(
                     "Rate limit message detected on page.",
                     suggested_wait_time=30,
@@ -326,13 +328,17 @@ async def detect_rate_limit(page: Page) -> None:
 
 async def scroll_to_bottom(
     page: Page, pause_time: float = 1.0, max_scrolls: int = 10
-) -> None:
+) -> int:
     """Scroll to the bottom of the page to trigger lazy loading.
 
     Args:
         page: Patchright page object
         pause_time: Time to pause between scrolls (seconds)
         max_scrolls: Maximum number of scroll attempts
+
+    Returns:
+        How many scrolls were made, which the rate limit counts for a list
+        that loads more as it goes.
     """
     for i in range(max_scrolls):
         previous_height = await page.evaluate("document.body.scrollHeight")
@@ -342,7 +348,8 @@ async def scroll_to_bottom(
         new_height = await page.evaluate("document.body.scrollHeight")
         if new_height == previous_height:
             logger.debug("Reached bottom after %d scrolls", i + 1)
-            break
+            return i + 1
+    return max_scrolls
 
 
 async def scroll_job_sidebar(

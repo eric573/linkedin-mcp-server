@@ -11,6 +11,7 @@ import anyio
 import anyio.lowlevel
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
 from linkedin_mcp_server.linkedin.content import PageContentReader
@@ -256,6 +257,7 @@ class FeedReader:
         # The feed has its own scroll container — window.scrollTo is a no-op.
         # mouse.wheel over the viewport center triggers the real scroll.
         _MAX_SCROLLS = 12
+        gate = pacing.gate()
         _MAX_STALE = 3
         _BATCH_WAIT = 6.0
         _WHEEL_DELTA = 2000
@@ -272,7 +274,13 @@ class FeedReader:
             if count >= num_posts:
                 break
 
+            # Every wheel asks LinkedIn for the next batch of posts, so each is
+            # counted against the rate limit, and the feed stops at its end.
+            if gate.loads_allowed(1) < 1:
+                logger.debug("Feed scrolling stopped by the rate limit")
+                break
             await page.mouse.wheel(0, _WHEEL_DELTA)
+            gate.record_loads(1)
 
             new_count = count
             for _ in range(int(_BATCH_WAIT)):
@@ -333,6 +341,8 @@ class FeedReader:
             logger.warning(
                 "Page %s returned only LinkedIn chrome (likely rate-limited)", url
             )
+            # The feed has no retry, so its one empty read is the signal.
+            pacing.note_empty_page()
             return ExtractedSection(text=RATE_LIMITED_SECTION_TEXT, references=[])
         cleaned = filter_linkedin_noise_lines(truncated)
         try:

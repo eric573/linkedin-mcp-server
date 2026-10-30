@@ -168,7 +168,7 @@
       "call": "search_jobs",
       "kind": "sleep",
       "reason": "sleep",
-      "seconds": 2.0,
+      "seconds": 4.1,
       "section": "search_results"
     },
     {

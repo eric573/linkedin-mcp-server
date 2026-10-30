@@ -144,6 +144,16 @@ class EnvironmentKeys:
     AUTO_IMPORT_FROM_BROWSER = "AUTO_IMPORT_FROM_BROWSER"
     DAEMON_ENABLED = "DAEMON_ENABLED"
     INSTALLER_TEMP_DIR = "INSTALLER_TEMP_DIR"
+    RATE_LIMIT_PAUSE_SECONDS = "RATE_LIMIT_PAUSE_SECONDS"
+    RATE_LIMIT_VISITS_PER_HOUR = "RATE_LIMIT_VISITS_PER_HOUR"
+    RATE_LIMIT_VISITS_PER_DAY = "RATE_LIMIT_VISITS_PER_DAY"
+    RATE_LIMIT_INVITES_PER_DAY = "RATE_LIMIT_INVITES_PER_DAY"
+    RATE_LIMIT_INVITES_PER_WEEK = "RATE_LIMIT_INVITES_PER_WEEK"
+    RATE_LIMIT_MESSAGES_PER_DAY = "RATE_LIMIT_MESSAGES_PER_DAY"
+    RATE_LIMIT_SEARCH_PAGES_PER_MONTH = "RATE_LIMIT_SEARCH_PAGES_PER_MONTH"
+    RATE_LIMIT_STOP_MINUTES = "RATE_LIMIT_STOP_MINUTES"
+    RATE_LIMIT_EMPTY_PAGE_STOP_MINUTES = "RATE_LIMIT_EMPTY_PAGE_STOP_MINUTES"
+    RATE_LIMIT_CHALLENGE_STOP_HOURS = "RATE_LIMIT_CHALLENGE_STOP_HOURS"
 
 
 # What ``manifest.json`` fills from ``user_config``, and the exact string each
@@ -427,7 +437,83 @@ def load_from_env(config: AppConfig) -> AppConfig:
         elif daemon_value in TRUTHY_VALUES:
             config.server.daemon_enabled = True
 
+    _load_rate_limits(config)
+
     return config
+
+
+def _load_rate_limits(config: AppConfig) -> None:
+    """Read how hard the server may use LinkedIn. 0 turns a limit off.
+
+    Validated again as a whole in ``RateLimitConfig.validate()``, which also
+    refuses a pause range that runs backwards.
+    """
+    if pause_env := os.environ.get(EnvironmentKeys.RATE_LIMIT_PAUSE_SECONDS):
+        low, high = _pause_range(pause_env)
+        config.rate_limit.pause_min_seconds = low
+        config.rate_limit.pause_max_seconds = high
+
+    for env_key, attribute in (
+        (EnvironmentKeys.RATE_LIMIT_VISITS_PER_HOUR, "visits_per_hour"),
+        (EnvironmentKeys.RATE_LIMIT_VISITS_PER_DAY, "visits_per_day"),
+        (EnvironmentKeys.RATE_LIMIT_INVITES_PER_DAY, "invites_per_day"),
+        (EnvironmentKeys.RATE_LIMIT_INVITES_PER_WEEK, "invites_per_week"),
+        (EnvironmentKeys.RATE_LIMIT_MESSAGES_PER_DAY, "messages_per_day"),
+        (EnvironmentKeys.RATE_LIMIT_SEARCH_PAGES_PER_MONTH, "search_pages_per_month"),
+    ):
+        raw = os.environ.get(env_key)
+        if not raw:
+            continue
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            raise ConfigurationError(
+                f"Invalid {env_key}: '{raw}'. Must be a whole number (0 turns it off)."
+            )
+        if value < 0:
+            raise ConfigurationError(
+                f"Invalid {env_key}: '{raw}'. Must not be negative (0 turns it off)."
+            )
+        setattr(config.rate_limit, attribute, value)
+
+    for env_key, attribute in (
+        (EnvironmentKeys.RATE_LIMIT_STOP_MINUTES, "stop_minutes"),
+        (EnvironmentKeys.RATE_LIMIT_EMPTY_PAGE_STOP_MINUTES, "empty_page_stop_minutes"),
+        (EnvironmentKeys.RATE_LIMIT_CHALLENGE_STOP_HOURS, "challenge_stop_hours"),
+    ):
+        raw = os.environ.get(env_key)
+        if not raw:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            raise ConfigurationError(f"Invalid {env_key}: '{raw}'. Must be a number.")
+        if not (math.isfinite(value) and value >= 0):
+            raise ConfigurationError(
+                f"Invalid {env_key}: '{raw}'. Must be a non-negative finite "
+                "number (0 turns it off)."
+            )
+        setattr(config.rate_limit, attribute, value)
+
+
+def _pause_range(raw: str) -> tuple[float, float]:
+    """``3-6`` as (3.0, 6.0), and a single ``4`` as (4.0, 4.0)."""
+    low_text, separator, high_text = raw.strip().partition("-")
+    try:
+        low = float(low_text)
+        high = float(high_text) if separator else low
+    except ValueError:
+        raise ConfigurationError(
+            f"Invalid {EnvironmentKeys.RATE_LIMIT_PAUSE_SECONDS}: '{raw}'. Must be "
+            "a number of seconds or a range such as 3-6."
+        )
+    if not (math.isfinite(low) and math.isfinite(high) and 0 <= low <= high):
+        raise ConfigurationError(
+            f"Invalid {EnvironmentKeys.RATE_LIMIT_PAUSE_SECONDS}: '{raw}'. Must "
+            "be a non-negative number of seconds or a range from low to high, "
+            "such as 3-6."
+        )
+    return low, high
 
 
 def load_from_args(config: AppConfig, argv: Sequence[str]) -> AppConfig:

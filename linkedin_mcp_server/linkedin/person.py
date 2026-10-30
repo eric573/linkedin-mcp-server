@@ -11,6 +11,7 @@ import re
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.destination import is_linkedin_landing
+from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
 from linkedin_mcp_server.linkedin.capture import (
@@ -31,7 +32,7 @@ from linkedin_mcp_server.linkedin.link_metadata import Reference
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
 from linkedin_mcp_server.linkedin.profile_page import ProfilePageReader
 from linkedin_mcp_server.linkedin.search_urls import build_people_search_url
-from linkedin_mcp_server.linkedin.session import NAV_DELAY, PageSession
+from linkedin_mcp_server.linkedin.session import PageSession
 from linkedin_mcp_server.linkedin.text import SIDEBAR_CHROME_EN
 
 if TYPE_CHECKING:
@@ -239,9 +240,6 @@ class PersonReader:
 
         try:
             for i, spec in enumerate(requested_ordered):
-                if i > 0:
-                    await self._session.delay(NAV_DELAY)
-
                 section_name = spec.name
                 url = base_url + spec.suffix
                 try:
@@ -305,6 +303,17 @@ class PersonReader:
                         and not rate_limited
                     ):
                         profile_urn = await self._profile_page._extract_profile_urn()
+                except PacingRefusedError as refused:
+                    # The rate limit refused this section's page, not the page
+                    # itself. What was read is kept, the rest is named with
+                    # when it can be had, and nothing read means the refusal
+                    # is the answer.
+                    if not sections:
+                        raise
+                    section_errors[section_name] = rate_limited_section_error(
+                        str(refused), retry_after=refused.retry_after
+                    )
+                    rate_limited = True
                 except LinkedInOperationError:
                     raise
                 except Exception as e:
@@ -410,8 +419,8 @@ class PersonReader:
 
         sidebar_profiles: dict[str, list[str]] = dict(sidebar_data.get("sections", {}))
         show_all_urls: dict[str, str] = dict(sidebar_data.get("showAllUrls", {}))
+        held_back: dict[str, Any] | None = None
 
-        first_show_all = True
         for section_key, show_all_url in show_all_urls.items():
             if "/premium" in show_all_url:
                 continue
@@ -424,12 +433,15 @@ class PersonReader:
                 )
                 continue
 
-            if not first_show_all:
-                await self._session.delay(NAV_DELAY)
-            first_show_all = False
-
             try:
                 await self._navigator._navigate_to_page(show_all_url)
+            except PacingRefusedError as refused:
+                # The profile's own sidebar is read already; the rate limit
+                # only stops the "Show all" pages that would lengthen it.
+                held_back = rate_limited_section_error(
+                    str(refused), retry_after=refused.retry_after
+                )
+                break
             except LinkedInOperationError:
                 raise
             except Exception:
@@ -470,10 +482,13 @@ class PersonReader:
                     merged.append(link)
             sidebar_profiles[section_key] = merged
 
-        return {
+        result: dict[str, Any] = {
             "url": url,
             "sidebar_profiles": sidebar_profiles,
         }
+        if held_back is not None:
+            result["section_errors"] = {"sidebar_profiles": held_back}
+        return result
 
     async def search_people(
         self,

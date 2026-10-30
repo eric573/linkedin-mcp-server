@@ -38,7 +38,7 @@ a page-owning collaborator.
 | `posts` | `PostSearch` | `browser-free` |
 | `profile_page` | `MessageTarget`, `MessageTargetResolution`, `ProfilePageReader`, `ReadMessageTarget` | `browser-free` |
 | `search_urls` | `CONTENT_DATE_POSTED_MAP`, `CONTENT_TYPE_MAP`, `EXPERIENCE_LEVEL_MAP`, `JOB_DATE_POSTED_MAP`, `JOB_TYPE_MAP`, `NETWORK_TOKENS`, `SORT_BY_MAP`, `WORK_TYPE_MAP`, `build_company_search_url()`, `build_content_search_url()`, `build_job_search_url()`, `build_people_search_url()` | `browser-free` |
-| `session` | `NAV_DELAY`, `PageSession` | `page-owning` |
+| `session` | `PageSession` | `page-owning` |
 | `text` | `DETAIL_CAPTURE_EN_US`, `DetailCaptureTextTable`, `JOB_APPLY_EN_US`, `JOB_POSTING_EN_US`, `JOB_SEARCH_EN_US`, `JobApplyTextTable`, `JobPostingTextTable`, `JobSearchTextTable`, `SIDEBAR_CHROME_EN`, `SidebarChromeTable`, `filter_linkedin_noise_lines()`, `strip_conversation_chrome()`, `strip_linkedin_noise()`, `truncate_linkedin_noise()` | `browser-free` |
 
 ## Internal import graph
@@ -50,7 +50,7 @@ a page-owning collaborator.
 - `connection_actions` -> `connection`, `identifiers`, `navigation`, `session`
 - `content` -> `session`, `text`
 - `contracts` -> `identifiers`, `link_metadata`
-- `conversations` -> `content`, `identifiers`, `link_metadata`, `navigation`, `profile_page`, `session`, `text`
+- `conversations` -> `content`, `contracts`, `identifiers`, `link_metadata`, `navigation`, `profile_page`, `session`, `text`
 - `extractor` -> `capture`, `company`, `connection_actions`, `content`, `contracts`, `conversations`, `feed`, `job_pages`, `job_policy`, `jobs`, `message_sender`, `navigation`, `person`, `posts`, `profile_page`, `session`, `text`
 - `feed` -> `content`, `contracts`, `feed_payload`, `navigation`, `session`, `text`
 - `feed_payload` -> `link_metadata`
@@ -58,7 +58,7 @@ a page-owning collaborator.
 - `identifiers` -> _(none)_
 - `job_pages` -> `capture`, `content`, `contracts`, `job_policy`, `link_metadata`, `navigation`, `session`, `text`
 - `job_policy` -> `link_metadata`, `text`
-- `jobs` -> `capture`, `contracts`, `identifiers`, `job_pages`, `job_policy`, `link_metadata`, `navigation`, `search_urls`, `session`, `text`
+- `jobs` -> `capture`, `contracts`, `identifiers`, `job_pages`, `job_policy`, `link_metadata`, `navigation`, `search_urls`, `text`
 - `link_metadata` -> _(none)_
 - `message_sender` -> `contracts`, `identifiers`, `navigation`, `session`
 - `navigation` -> `session`

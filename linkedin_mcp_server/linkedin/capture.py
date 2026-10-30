@@ -20,6 +20,7 @@ from linkedin_mcp_server.core.destination import (
     linkedin_element,
     raise_if_off_linkedin,
 )
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.exceptions import (
     LinkedInOperationError,
     OffLinkedInLandingError,
@@ -283,7 +284,12 @@ class SectionCapture:
                 await self._session.delay(RATE_LIMIT_RETRY_DELAY)
                 if listener is not None:
                     listener.install()
-                return await self._capture_once(url, section_name, plan, listener)
+                result = await self._capture_once(url, section_name, plan, listener)
+                if result.text == RATE_LIMITED_SECTION_TEXT:
+                    # Empty again after the backoff: the usual sign of
+                    # throttling, so every request stops for a while.
+                    pacing.note_empty_page()
+                return result
 
             except LinkedInOperationError:
                 raise
@@ -413,6 +419,7 @@ class SectionCapture:
 
         if CaptureMode.DETAILS in plan.mode:
             max_clicks = plan.max_scrolls if plan.max_scrolls is not None else 5
+            gate = pacing.gate()
             for i in range(max_clicks):
                 button = self._session.page.locator("main button").filter(
                     has_text=self._detail_text.expansion_button_pattern
@@ -424,10 +431,16 @@ class SectionCapture:
                     target = button.first
                     if not await target.is_visible():
                         break
+                    # Each click asks LinkedIn for more items, so it is counted
+                    # and paced like a scroll that loads (`core/pacing.py`).
+                    if gate.loads_allowed(1) < 1:
+                        logger.debug("'Show more' stopped by the rate limit")
+                        break
                     async with linkedin_element(target, timeout=2000) as button:
                         await button.scroll_into_view_if_needed(timeout=2000)
                         await button.click(timeout=2000)
-                    await self._session.delay(1.0)
+                    gate.record_loads(1)
+                    await self._session.delay(gate.load_pause(1.0))
                 except OffLinkedInLandingError:
                     raise
                 except PlaywrightTimeoutError:
@@ -453,10 +466,23 @@ class SectionCapture:
 
         if CaptureMode.ACTIVITY in plan.mode:
             scrolls = plan.max_scrolls if plan.max_scrolls is not None else 10
-            await self._session.scroll_body(pause_time=1.0, max_scrolls=scrolls)
+            pause = 1.0
         else:
             scrolls = plan.max_scrolls if plan.max_scrolls is not None else 5
-            await self._session.scroll_body(pause_time=0.5, max_scrolls=scrolls)
+            pause = 0.5
+        if plan.mode & (CaptureMode.ACTIVITY | CaptureMode.POST_PERMALINKS):
+            # An endless list, where every scroll asks LinkedIn for the next
+            # batch: counted and paced like the rest of the traffic
+            # (`core/pacing.py`), and cut short when the budget runs out.
+            # Scrolling a page that is already loaded, below, costs nothing.
+            gate = pacing.gate()
+            scrolls = gate.loads_allowed(scrolls)
+            made = await self._session.scroll_body(
+                pause_time=gate.load_pause(pause), max_scrolls=scrolls
+            )
+            gate.record_loads(scrolls if made is None else made)
+        else:
+            await self._session.scroll_body(pause_time=pause, max_scrolls=scrolls)
 
         raw_result = await self._content._extract_root_content(["main"])
         raw = raw_result["text"]

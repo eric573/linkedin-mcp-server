@@ -14,6 +14,7 @@ import anyio
 import pytest
 from fastmcp import FastMCP
 
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.linkedin import feed as feed_module
 from linkedin_mcp_server.linkedin import session as session_module
@@ -255,6 +256,34 @@ class TestFeedScrollCeiling:
         assert len(result.references) < self._NUM_POSTS
         page.assert_clean()
 
+    async def test_the_rate_limit_stops_a_producing_feed_before_its_ceiling(self):
+        """Every wheel asks LinkedIn for a batch, so the budget bounds them."""
+        recorder = TraceRecorder(
+            "feed-scroll-budget",
+            _COMMON_ALLOWED | {"response.body.start", "response.body.finish"},
+        )
+        clock = FakeClock(recorder)
+        page = _page(recorder).script("evaluate:root_content", _root("Feed content"))
+        page.script("evaluate:feed_post_boundaries", {"posts": []})
+        page.script(
+            "mouse.wheel",
+            *[self._one_batch_per_wheel(page, index) for index in range(3)],
+        )
+        reader = _reader(page)
+
+        async with boundaries(recorder, clock):
+            # 58.4 of the hour's 60 spent: the feed visit takes one more, and
+            # what is left pays for three wheels at a fifth each.
+            pacing.gate().record_conversation_opens(58)
+            pacing.gate().record_loads(2)
+            with recorder.context("extract_feed", "feed"):
+                result = await reader.extract_feed(num_posts=self._NUM_POSTS)
+
+        wheels = [event for event in recorder.events if event["kind"] == "mouse.wheel"]
+        assert len(wheels) == 3
+        assert len(result.references) == 3
+        page.assert_clean()
+
 
 class TestFeedScrollRecovery:
     """Response-read progress contracts inside the feed scroll loop."""
@@ -440,9 +469,13 @@ class TestFeedOutputBoundaries:
                     captured,
                     [],
                 )
+            # Only a chrome-only feed reads as throttling, and that one stops
+            # every request: the feed has no retry to wait for.
+            stopped = pacing.gate().stop_active()
 
         assert result.text == expected_text
         assert len(result.references) == reference_count
+        assert stopped is warns
         warning = "returned only LinkedIn chrome (likely rate-limited)"
         assert (warning in caplog.text) is warns
         page.assert_clean()

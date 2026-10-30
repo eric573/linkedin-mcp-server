@@ -11,6 +11,8 @@ import pytest
 from patchright.async_api import Error as PatchrightError
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from linkedin_mcp_server.config.schema import RateLimitConfig
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.linkedin import jobs as jobs_module
 from linkedin_mcp_server.linkedin.capture import (
@@ -74,6 +76,33 @@ def captured(
         landed_url=page.url,
         scroll_seconds=scroll_seconds,
     )
+
+
+def _pacing_on(clock, *, pause: float) -> pacing.Pacing:
+    """Install a gate that pauses *pause* seconds after each load, on *clock*.
+
+    Its limits are off, so only the pause is in play. The gate does its
+    waiting inside the navigation, and that is the wait the search's time
+    prediction has to account for.
+    """
+
+    async def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    gate = pacing.Pacing(
+        RateLimitConfig(
+            pause_min_seconds=pause,
+            pause_max_seconds=pause,
+            visits_per_hour=0,
+            visits_per_day=0,
+        ),
+        None,
+        clock=pacing.Clock(
+            wall=clock.monotonic, monotonic=clock.monotonic, sleep=sleep
+        ),
+    )
+    pacing.install_gate(gate)
+    return gate
 
 
 class TestReadJob:
@@ -345,10 +374,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
 
@@ -381,10 +406,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
@@ -428,10 +449,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
@@ -607,10 +624,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
 
@@ -643,10 +656,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
@@ -690,10 +699,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=2)
@@ -784,10 +789,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=False,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=2)
 
@@ -825,10 +826,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=2)
@@ -868,10 +865,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", location="Berlin", max_pages=1)
@@ -920,10 +913,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs(
@@ -986,10 +975,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", location="Berlin", max_pages=2)
 
@@ -1032,10 +1017,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", location="Berlin")
@@ -1083,10 +1064,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
 
@@ -1128,10 +1105,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", location="Berlin", max_pages=1)
@@ -1175,10 +1148,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
@@ -1224,10 +1193,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=3)
@@ -1305,10 +1270,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=5)
 
@@ -1362,10 +1323,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=1,
             ) as mock_total_pages,
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=10)
 
@@ -1409,9 +1366,6 @@ class TestSearchJobs:
             clock.now += 12.0
             return captured(mock_page, extracted("Job results"), scroll_seconds=12.0)
 
-        async def sleep(seconds: float) -> None:
-            clock.now += seconds
-
         # Fresh ids every call, or the search stops after two navigations and
         # the budget is never spent over the ten this is named for.
         pages = [[str(100 + p * 10 + i) for i in range(10)] for p in range(10)]
@@ -1430,10 +1384,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                side_effect=sleep,
             ),
         ):
             await reader.search_jobs("python", max_pages=10, tool_timeout=100000)
@@ -1469,9 +1419,6 @@ class TestSearchJobs:
             clock.now += 12.0
             return captured(mock_page, extracted("Job results"))
 
-        async def sleep(seconds: float) -> None:
-            clock.now += seconds
-
         pages = [[str(100 + p * 10 + i) for i in range(10)] for p in range(10)]
 
         with (
@@ -1488,10 +1435,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                side_effect=sleep,
             ),
         ):
             await reader.search_jobs("python", max_pages=10, tool_timeout=100000)
@@ -1505,12 +1448,13 @@ class TestSearchJobs:
         against a 180s default, so the guard never fires on a healthy run and
         this drives it with navigations slow enough to reach the budget.
 
-        The page cost is chosen to land between the two arithmetics. Against a
-        144s budget, six pages of 18.7s plus five delays of 2s reach 122.2s, and
-        a seventh costs 20.7s and finishes at 142.9s. Charging the delay once
-        admits it; charging it twice predicts 144.9s and drops a page the run
-        had time for. The fake sleep therefore has to move the clock, or the
-        delay never enters the sum at all and neither does the defect.
+        The page cost is chosen to land between the two arithmetics. Every
+        page after the first waits out a 2s pause inside its navigation, as the
+        pacing gate makes it. Against a 144s budget, six pages of 18.7s plus
+        five waits reach 122.2s, and a seventh costs 20.7s and finishes at
+        142.9s. Charging the wait once admits it; charging it twice, once as
+        the wait to come and again inside the page it was timed with, predicts
+        144.9s and drops a page the run had time for.
         """
 
         class Clock:
@@ -1523,18 +1467,19 @@ class TestSearchJobs:
                 return self.now
 
         clock = Clock()
+        gate = _pacing_on(clock, pause=2.0)
         reader = _reader(mock_page)
         seen: list[float | None] = []
 
         async def read_page(url, section_name, scroll_deadline=None, **kwargs):
             seen.append(scroll_deadline)
+            # What `PageNavigator` does: wait for the gate, load, and start
+            # the next pause when the load ends.
+            await gate.before_visit(url)
             navigate(mock_page, url)
             clock.now += 18.7
+            gate.after_visit()
             return captured(mock_page, extracted("Job results"))
-
-        async def sleep(seconds: float) -> None:
-            """The inter-page delay costs wall clock, the same as a navigation."""
-            clock.now += seconds
 
         pages = [[str(100 + p * 10 + i) for i in range(10)] for p in range(10)]
 
@@ -1552,10 +1497,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                side_effect=sleep,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=10)
@@ -1570,15 +1511,15 @@ class TestSearchJobs:
         }
 
     async def test_the_next_navigation_delay_is_part_of_the_prediction(self, mock_page):
-        """The guard budgets the delay before a page, not just the page.
+        """The guard budgets the wait before a page, not just the page.
 
         The test above cannot see this: at a 144s budget the run stops after
-        seven pages whether or not the prediction counts ``_NAV_DELAY``, so
+        seven pages whether or not the prediction counts the gate's wait, so
         dropping it from the sum stays green. This budget is chosen to sit
         between the two arithmetics instead. Six pages reach 122.2s; a seventh
-        costs 2s of delay plus 18.7s of navigation and would end at 142.9s,
-        past the 141s budget, while the same sum without the delay predicts
-        140.9s and admits a page the run cannot pay for.
+        costs a 2s wait plus 18.7s of navigation and would end at 142.9s, past
+        the 141s budget, while the same sum without the wait predicts 140.9s
+        and admits a page the run cannot pay for.
         """
 
         class Clock:
@@ -1589,17 +1530,17 @@ class TestSearchJobs:
                 return self.now
 
         clock = Clock()
+        gate = _pacing_on(clock, pause=2.0)
         reader = _reader(mock_page)
         seen: list[float | None] = []
 
         async def read_page(url, section_name, scroll_deadline=None, **kwargs):
             seen.append(scroll_deadline)
+            await gate.before_visit(url)
             navigate(mock_page, url)
             clock.now += 18.7
+            gate.after_visit()
             return captured(mock_page, extracted("Job results"))
-
-        async def sleep(seconds: float) -> None:
-            clock.now += seconds
 
         pages = [[str(100 + p * 10 + i) for i in range(10)] for p in range(10)]
 
@@ -1617,10 +1558,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                side_effect=sleep,
             ),
         ):
             # 176.25 * _SEARCH_TIMEOUT_FRACTION is a 141s budget.
@@ -1672,10 +1609,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             # A 40s budget from t=7.
             await reader.search_jobs("python", max_pages=2, tool_timeout=50)
@@ -1703,10 +1636,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=0)
@@ -1740,10 +1669,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs(
@@ -1789,10 +1714,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=2)
 
@@ -1821,10 +1742,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("nonexistent_xyz")
@@ -1870,10 +1787,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
 
@@ -1910,10 +1823,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", location="Berlin", max_pages=1)
@@ -1965,10 +1874,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=2)
 
@@ -2003,10 +1908,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("xyzzy123", max_pages=1)
@@ -2043,10 +1944,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("founder's associate", max_pages=2)
@@ -2108,10 +2005,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("qzxvwk plorbnaut", max_pages=1)
@@ -2181,10 +2074,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=3)
 
@@ -2242,10 +2131,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", location="Berlin", max_pages=2)
 
@@ -2284,10 +2169,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=2)
 
@@ -2313,10 +2194,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
@@ -2352,10 +2229,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=2)
 
@@ -2389,10 +2262,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
 
@@ -2424,10 +2293,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
@@ -2473,10 +2338,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=2)
 
@@ -2508,10 +2369,6 @@ class TestSearchJobs:
                 "_get_total_list_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.get_saved_jobs(max_pages=1, stage="applied")
@@ -2549,10 +2406,6 @@ class TestSearchJobs:
             ),
             patch.object(
                 reader._navigator, "_raise_if_auth_barrier", new_callable=AsyncMock
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.get_saved_jobs(max_pages=1, stage="applied")
@@ -2593,10 +2446,6 @@ class TestSearchJobs:
             ),
             patch.object(
                 reader._navigator, "_raise_if_auth_barrier", new_callable=AsyncMock
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.get_saved_jobs(max_pages=1, stage="applied")
@@ -2647,10 +2496,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             with pytest.raises(AuthenticationError, match="--login"):
                 await reader.search_jobs("python", max_pages=2)
@@ -2698,10 +2543,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=2)
 
@@ -2734,10 +2575,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
 
@@ -2766,10 +2603,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=["100"],
             ) as mock_ids,
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
 
@@ -2801,10 +2634,6 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=["100"],
             ) as mock_ids,
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
 
@@ -2847,10 +2676,6 @@ class TestSearchJobs:
                 "_get_total_search_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.search_jobs("python", max_pages=1)
@@ -2916,10 +2741,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=1)
 
@@ -2955,10 +2776,6 @@ class TestGetSavedJobs:
                 "_get_total_list_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.get_saved_jobs(max_pages=1)
@@ -2997,10 +2814,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=1)
 
@@ -3031,10 +2844,6 @@ class TestGetSavedJobs:
                 "_get_total_list_pages",
                 new_callable=AsyncMock,
                 return_value=2,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.get_saved_jobs(max_pages=2)
@@ -3069,10 +2878,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=3)
 
@@ -3103,10 +2908,6 @@ class TestGetSavedJobs:
                 "_get_total_list_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.get_saved_jobs(max_pages=5)
@@ -3219,10 +3020,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=1)
 
@@ -3245,10 +3042,6 @@ class TestGetSavedJobs:
                 "_get_total_list_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.get_saved_jobs(max_pages=1)
@@ -3288,10 +3081,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=3)
 
@@ -3326,10 +3115,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=2,
             ) as mock_total_pages,
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=10)
 
@@ -3367,10 +3152,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=3)
 
@@ -3406,10 +3187,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=1)
 
@@ -3443,10 +3220,6 @@ class TestGetSavedJobs:
                 "_get_total_list_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             with pytest.raises(AuthenticationError, match="--login"):
@@ -3484,10 +3257,6 @@ class TestGetSavedJobs:
                 "_get_total_list_pages",
                 new_callable=AsyncMock,
                 return_value=None,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.get_saved_jobs(max_pages=2)
@@ -3538,10 +3307,6 @@ class TestGetSavedJobs:
                 reader._pages,
                 "_get_total_list_pages",
                 side_effect=count_pages_and_drift,
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
             ),
         ):
             result = await reader.get_saved_jobs(max_pages=2)
@@ -3599,10 +3364,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=2)
 
@@ -3654,10 +3415,6 @@ class TestGetSavedJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
-            patch(
-                "linkedin_mcp_server.linkedin.jobs.asyncio.sleep",
-                new_callable=AsyncMock,
-            ),
         ):
             result = await reader.get_saved_jobs(max_pages=2)
 
@@ -3670,3 +3427,93 @@ class TestGetSavedJobs:
             },
             {"kind": "job", "url": "/jobs/view/200/", "text": "Two"},
         ]
+
+
+class TestARateLimitRefusalMidSearch:
+    """The pacing gate refusing a later page keeps the pages already read."""
+
+    @staticmethod
+    def _refused():
+        return pacing.PacingRefusedError(
+            "Rate limit: 60 of the 60 page visits ...", 240
+        )
+
+    async def test_the_search_keeps_its_pages_and_says_where_to_resume(self, mock_page):
+        reader = _reader(mock_page)
+        refused = self._refused()
+
+        async def read_page(url, section_name, **kwargs):
+            if "start=" in url:
+                raise refused
+            navigate(mock_page, url)
+            return captured(mock_page, extracted("Job results"))
+
+        with (
+            patch.object(reader._pages, "_extract_search_page", side_effect=read_page),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["101", "102"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.search_jobs("python", max_pages=3)
+
+        assert result["job_ids"] == ["101", "102"]
+        assert result["pagination"] == {
+            "pages_fetched": 1,
+            "next_offset": 2,
+            "reason": "rate_limited",
+        }
+        error = result["section_errors"]["search_results"]
+        assert (error["error_type"], error["retry_after"]) == ("rate_limit", 240)
+
+    async def test_a_search_refused_at_its_first_page_is_refused(self, mock_page):
+        reader = _reader(mock_page)
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_search_page",
+                new_callable=AsyncMock,
+                side_effect=self._refused(),
+            ),
+            pytest.raises(pacing.PacingRefusedError),
+        ):
+            await reader.search_jobs("python", max_pages=3)
+
+    async def test_saved_jobs_keep_their_pages(self, mock_page):
+        mock_page.url = "https://www.linkedin.com/jobs-tracker/?stage=saved"
+        reader = _reader(mock_page)
+        with (
+            patch.object(
+                reader._pages,
+                "_extract_saved_jobs_page",
+                new_callable=AsyncMock,
+                side_effect=[
+                    captured(mock_page, extracted("Saved Job 1\nSaved Job 2")),
+                    self._refused(),
+                ],
+            ),
+            patch.object(
+                reader._pages,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["111", "222"],
+            ),
+            patch.object(
+                reader._pages,
+                "_get_total_list_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await reader.get_saved_jobs(max_pages=2)
+
+        assert result["job_ids"] == ["111", "222"]
+        assert result["section_errors"]["saved_jobs"]["retry_after"] == 240

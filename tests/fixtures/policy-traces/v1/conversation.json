@@ -98,7 +98,7 @@
       "call": "get_conversation",
       "kind": "sleep",
       "reason": "sleep",
-      "seconds": 0.5,
+      "seconds": 1.25,
       "section": "conversation"
     },
     {
@@ -115,7 +115,7 @@
       "call": "get_conversation",
       "kind": "sleep",
       "reason": "sleep",
-      "seconds": 0.5,
+      "seconds": 1.25,
       "section": "conversation"
     },
     {
@@ -132,7 +132,7 @@
       "call": "get_conversation",
       "kind": "sleep",
       "reason": "sleep",
-      "seconds": 0.5,
+      "seconds": 1.25,
       "section": "conversation"
     },
     {

@@ -5,12 +5,13 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import asyncio
 import logging
 import time
 
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.exceptions import LinkedInOperationError
+from linkedin_mcp_server.core.pacing import PacingRefusedError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
 from linkedin_mcp_server.linkedin.capture import (
     CaptureMode,
@@ -46,7 +47,6 @@ from linkedin_mcp_server.linkedin.job_policy import (
 from linkedin_mcp_server.linkedin.link_metadata import Reference, dedupe_references
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
 from linkedin_mcp_server.linkedin.search_urls import build_job_search_url
-from linkedin_mcp_server.linkedin.session import NAV_DELAY
 from linkedin_mcp_server.linkedin.text import (
     JOB_APPLY_EN_US,
     JOB_POSTING_EN_US,
@@ -269,6 +269,7 @@ class JobReader:
         started = time.monotonic()
         budget = tool_timeout * SEARCH_TIMEOUT_FRACTION
         slowest_page = 0.0
+        gate = pacing.gate()
 
         for page_num in range(max_pages):
             # Stop once the offset is past the last advertised result
@@ -285,27 +286,29 @@ class JobReader:
                 break
 
             elapsed = time.monotonic() - started
-            if page_num > 0 and elapsed + NAV_DELAY + slowest_page > budget:
+            # What the pacing gate will make the next navigation wait, rather
+            # than a constant: the pause runs from the end of the last load,
+            # so reading that page has already paid some or all of it.
+            upcoming_wait = gate.expected_wait()
+            if page_num > 0 and elapsed + upcoming_wait + slowest_page > budget:
                 logger.debug(
                     "Stopping after %d pages: %.1fs spent, another page costs "
                     "up to %.1fs and the budget is %.1fs",
                     page_num,
                     elapsed,
-                    NAV_DELAY + slowest_page,
+                    upcoming_wait + slowest_page,
                     budget,
                 )
                 stop_reason = "time_budget"
                 break
 
-            if page_num > 0:
-                await asyncio.sleep(NAV_DELAY)
-
-            # Started after the delay, because the prediction above adds
-            # `NAV_DELAY` to `slowest_page` itself. Timing from before the
-            # sleep folds it into every page after the first and then charges
-            # it a second time, which stops a page early for every two seconds
-            # of delay the run has already paid for.
+            # The gate waits inside the navigation, so its waits are taken back
+            # out of the page's own time below. Charged to `slowest_page`, each
+            # would be counted again by the prediction above, which already
+            # adds the wait to come, and stop a page early for every pause the
+            # run has already paid for.
             page_started = time.monotonic()
+            waited_before = gate.waited_seconds
 
             url = base_url if offset == 0 else f"{base_url}&start={offset}"
             # Against what is left of the tool's own timeout as well. The
@@ -329,7 +332,9 @@ class JobReader:
                 )
                 extracted = capture.section
                 pages_fetched += 1
-                slowest_page = max(slowest_page, time.monotonic() - page_started)
+                page_seconds = time.monotonic() - page_started
+                page_seconds -= gate.waited_seconds - waited_before
+                slowest_page = max(slowest_page, page_seconds)
                 scroll_budget_left = max(
                     0.0, scroll_budget_left - capture.scroll_seconds
                 )
@@ -551,6 +556,16 @@ class JobReader:
                 if page_refs:
                     page_references.extend(page_refs)
 
+            except PacingRefusedError as refused:
+                # The rate limit refused the next page. The pages read so far
+                # stand, and `pagination` says where to resume and why.
+                if not page_texts:
+                    raise
+                section_errors["search_results"] = rate_limited_section_error(
+                    str(refused), retry_after=refused.retry_after
+                )
+                stop_reason = "rate_limited"
+                break
             except LinkedInOperationError:
                 raise
             except Exception as e:
@@ -659,9 +674,6 @@ class JobReader:
             if total_pages is not None and page_num >= total_pages:
                 logger.debug("All %d saved-jobs pages fetched, stopping", total_pages)
                 break
-
-            if page_num > 0:
-                await asyncio.sleep(NAV_DELAY)
 
             url = (
                 base_url
@@ -793,6 +805,16 @@ class JobReader:
                 if extracted.references:
                     page_references.extend(extracted.references)
 
+            except PacingRefusedError as refused:
+                # As in the search: keep the pages read, say when the rest
+                # can be had, and answer with the refusal only when nothing
+                # was read.
+                if not page_texts:
+                    raise
+                section_errors["saved_jobs"] = rate_limited_section_error(
+                    str(refused), retry_after=refused.retry_after
+                )
+                break
             except LinkedInOperationError:
                 raise
             except Exception as e:

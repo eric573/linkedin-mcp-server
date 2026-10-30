@@ -27,7 +27,7 @@ from linkedin_mcp_server.linkedin.contracts import (
 from linkedin_mcp_server.linkedin.fields import COMPANY_SECTIONS
 from linkedin_mcp_server.linkedin.link_metadata import Reference
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
-from linkedin_mcp_server.linkedin.session import NAV_DELAY, PageSession
+from linkedin_mcp_server.linkedin.session import PageSession
 
 
 def _reader(page) -> CompanyReader:
@@ -277,50 +277,6 @@ class TestReadCompany:
             "about": "overlay text",
             "custom": "standard text",
         }
-
-    async def test_the_delay_is_taken_between_sections_and_not_before_the_first(
-        self, mock_page
-    ):
-        """One pace per gap, at ``NAV_DELAY``, through the session boundary.
-
-        The duration is asserted as well as the count: a delay of the wrong
-        length paces the walk wrongly against LinkedIn while every
-        count-only assertion stays green.
-        """
-        reader = _reader(mock_page)
-        with (
-            patch.object(
-                reader._capture,
-                "capture",
-                new_callable=AsyncMock,
-                return_value=extracted("text"),
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.session.asyncio.sleep",
-                new_callable=AsyncMock,
-            ) as mock_sleep,
-        ):
-            await reader.read_company("testcorp", {"about", "posts", "jobs"})
-
-        assert mock_sleep.await_args_list == [call(NAV_DELAY), call(NAV_DELAY)]
-
-    async def test_a_single_section_walk_never_paces(self, mock_page):
-        reader = _reader(mock_page)
-        with (
-            patch.object(
-                reader._capture,
-                "capture",
-                new_callable=AsyncMock,
-                return_value=extracted("about text"),
-            ),
-            patch(
-                "linkedin_mcp_server.linkedin.session.asyncio.sleep",
-                new_callable=AsyncMock,
-            ) as mock_sleep,
-        ):
-            await reader.read_company("testcorp", {"about"})
-
-        mock_sleep.assert_not_awaited()
 
     async def test_a_rate_limited_company_section_is_reported_and_stops_the_rest(
         self, mock_page
@@ -753,3 +709,23 @@ def test_the_real_section_table_is_the_one_the_walk_orders_by():
     """
     assert list(COMPANY_SECTIONS) == ["about", "posts", "jobs"]
     assert list(company_module.COMPANY_SECTIONS) == list(COMPANY_SECTIONS)
+
+
+class TestARateLimitRefusalMidWalk:
+    async def test_the_sections_read_before_it_are_kept(self, mock_page):
+        from linkedin_mcp_server.core.pacing import PacingRefusedError
+
+        reader = _reader(mock_page)
+        capture = AsyncMock(
+            side_effect=[
+                extracted("about text"),
+                PacingRefusedError("Rate limit stop: ...", 900),
+            ]
+        )
+        with patch.object(reader._capture, "capture", capture):
+            result = await reader.read_company("testcorp", {"about", "posts", "jobs"})
+
+        assert result["sections"] == {"about": "about text"}
+        assert result["section_errors"]["posts"]["error_type"] == "rate_limit"
+        assert result["section_errors"]["posts"]["retry_after"] == 900
+        assert capture.await_count == 2

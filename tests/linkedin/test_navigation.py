@@ -8,6 +8,7 @@ from patchright.async_api import Error as PatchrightError
 
 import pytest
 
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.exceptions import (
     AccountRestrictedError,
     AuthenticationError,
@@ -966,3 +967,107 @@ class TestALandingOffLinkedInStopsTheRead:
         assert result.text == ""
         assert result.error is not None
         assert "ERR_NAME_NOT_RESOLVED" in result.error["error_message"]
+
+
+class _RecordingGate(pacing.Pacing):
+    """A pacing gate that records what the navigator asks of it."""
+
+    def __init__(self, events: list, *, on_before=None) -> None:
+        super().__init__(None, None)
+        self.events = events
+        self.on_before = on_before
+
+    async def before_visit(self, url: str, *, deadline: float | None = None) -> None:
+        self.events.append(("before", url, deadline))
+        if self.on_before is not None:
+            self.on_before()
+
+    def after_visit(self) -> None:
+        self.events.append(("after",))
+
+
+class TestPacedNavigation:
+    """Every page visit asks the pacing gate first (`core/pacing.py`)."""
+
+    URL = "https://www.linkedin.com/in/testuser/"
+
+    def _install(self, mock_page, *, on_before=None) -> list:
+        events: list = []
+        pacing.install_gate(_RecordingGate(events, on_before=on_before))
+
+        async def goto(url, **kwargs):
+            events.append(("goto", url))
+
+        mock_page.goto = AsyncMock(side_effect=goto)
+        return events
+
+    async def test_the_gate_is_asked_first_and_restarts_the_pause_when_the_page_ends(
+        self, mock_page
+    ):
+        events = self._install(mock_page)
+        navigator = PageNavigator(PageSession(mock_page))
+
+        with patch(
+            "linkedin_mcp_server.linkedin.navigation.detect_auth_barrier_quick",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            await navigator._navigate_to_page(self.URL, deadline=99.0)
+
+        assert events == [("before", self.URL, 99.0), ("goto", self.URL), ("after",)]
+
+    async def test_a_failed_load_restarts_the_pause_too(self, mock_page):
+        """The request went out whether or not the page arrived."""
+        events = self._install(mock_page)
+        mock_page.goto = AsyncMock(side_effect=PatchrightError("net::ERR_FAILED"))
+        navigator = PageNavigator(PageSession(mock_page))
+
+        with (
+            patch(
+                "linkedin_mcp_server.linkedin.navigation.detect_auth_barrier",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            pytest.raises(PatchrightError),
+        ):
+            await navigator._navigate_to_page(self.URL)
+
+        assert events == [("before", self.URL, None), ("after",)]
+
+    async def test_a_refused_visit_loads_nothing(self, mock_page):
+        def refuse() -> None:
+            raise pacing.PacingRefusedError("Rate limit stop", 900)
+
+        self._install(mock_page, on_before=refuse)
+        navigator = PageNavigator(PageSession(mock_page))
+
+        with pytest.raises(pacing.PacingRefusedError):
+            await navigator._navigate_to_page(self.URL)
+
+        mock_page.goto.assert_not_awaited()
+
+    async def test_time_spent_at_the_gate_comes_out_of_the_pages_own_timeout(
+        self, mock_page, monkeypatch
+    ):
+        """The page is timed from after the wait, against the same deadline.
+
+        Worked out before the wait, the timeout would let the page run past
+        its deadline by however long the gate held it.
+        """
+        now = [10.0]
+        monkeypatch.setattr(session_module.time, "monotonic", lambda: now[0])
+
+        def wait_three_seconds() -> None:
+            now[0] += 3.0
+
+        self._install(mock_page, on_before=wait_three_seconds)
+        navigator = PageNavigator(PageSession(mock_page))
+
+        with patch(
+            "linkedin_mcp_server.linkedin.navigation.detect_auth_barrier_quick",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            await navigator._navigate_to_page(self.URL, deadline=20.0)
+
+        assert mock_page.goto.await_args.kwargs["timeout"] == 7000.0

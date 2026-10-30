@@ -17,6 +17,7 @@ from .exceptions import (
     AuthenticationError,
     OffLinkedInLandingError,
 )
+from .pacing import note_account_restricted, note_auth_route
 
 logger = logging.getLogger(__name__)
 
@@ -347,6 +348,7 @@ def _is_account_restricted_url(url: str) -> bool:
 def _raise_if_account_restricted(url: str) -> None:
     if _is_account_restricted_url(url):
         logger.warning("LinkedIn account restriction page: %s", url)
+        note_account_restricted()
         raise AccountRestrictedError()
 
 
@@ -367,6 +369,7 @@ def raise_if_auth_route(url: str) -> None:
     _raise_if_account_restricted(url)
     if _is_auth_blocker_url(url):
         logger.warning("Authentication barrier detected on %s", url)
+        note_auth_route(url)
         raise AuthenticationError(
             "LinkedIn requires interactive re-authentication. "
             "Run with --login and complete the account selection/sign-in flow."

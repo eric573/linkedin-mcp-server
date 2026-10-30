@@ -8,7 +8,7 @@ loading from CLI arguments and environment variables.
 import logging
 
 from .loaders import load_config
-from .schema import AppConfig, BrowserConfig, ServerConfig
+from .schema import AppConfig, BrowserConfig, RateLimitConfig, ServerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,7 @@ def reset_config() -> None:
 __all__ = [
     "AppConfig",
     "BrowserConfig",
+    "RateLimitConfig",
     "ServerConfig",
     "get_config",
     "reset_config",

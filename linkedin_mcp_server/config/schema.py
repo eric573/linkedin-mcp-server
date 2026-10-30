@@ -74,6 +74,23 @@ AUTH_REPAIR_LOGIN_WAIT_FRACTION: float = 5 / 6
 # long: a reopen costs one more LinkedIn request. 0 disables it.
 DEFAULT_BROWSER_IDLE_TIMEOUT_SECONDS: float = 600.0
 
+# How hard the server may use LinkedIn, enforced by `core/pacing.py`. LinkedIn
+# publishes none of its limits, so these are cautious starting points rather
+# than measurements. Every one is a setting, and 0 turns it off.
+DEFAULT_RATE_LIMIT_PAUSE_MIN_SECONDS: float = 3.0
+DEFAULT_RATE_LIMIT_PAUSE_MAX_SECONDS: float = 6.0
+DEFAULT_RATE_LIMIT_VISITS_PER_HOUR: int = 60
+DEFAULT_RATE_LIMIT_VISITS_PER_DAY: int = 300
+DEFAULT_RATE_LIMIT_INVITES_PER_DAY: int = 20
+# LinkedIn's own weekly invitation limit is reported at about 100 to 200.
+DEFAULT_RATE_LIMIT_INVITES_PER_WEEK: int = 100
+DEFAULT_RATE_LIMIT_MESSAGES_PER_DAY: int = 50
+# Off by default: only a free account meets LinkedIn's monthly search limit.
+DEFAULT_RATE_LIMIT_SEARCH_PAGES_PER_MONTH: int = 0
+DEFAULT_RATE_LIMIT_STOP_MINUTES: float = 15.0
+DEFAULT_RATE_LIMIT_EMPTY_PAGE_STOP_MINUTES: float = 5.0
+DEFAULT_RATE_LIMIT_CHALLENGE_STOP_HOURS: float = 24.0
+
 #: The one profile root this server may destroy without being told it owns it.
 #: Spelled with ``~`` rather than resolved here so it follows the account that
 #: runs the process: on the host that is the user's home, and in the published
@@ -463,17 +480,77 @@ class ServerConfig:
 
 
 @dataclass
+class RateLimitConfig:
+    """How hard the server may use LinkedIn, enforced by ``core/pacing.py``.
+
+    One budget for the whole account rather than one per tool: LinkedIn sees
+    what the account does, not which tool asked. A value of 0 turns that limit
+    off.
+    """
+
+    # The pause before each page visit is drawn from this range.
+    pause_min_seconds: float = DEFAULT_RATE_LIMIT_PAUSE_MIN_SECONDS
+    pause_max_seconds: float = DEFAULT_RATE_LIMIT_PAUSE_MAX_SECONDS
+    visits_per_hour: int = DEFAULT_RATE_LIMIT_VISITS_PER_HOUR
+    visits_per_day: int = DEFAULT_RATE_LIMIT_VISITS_PER_DAY
+    invites_per_day: int = DEFAULT_RATE_LIMIT_INVITES_PER_DAY
+    invites_per_week: int = DEFAULT_RATE_LIMIT_INVITES_PER_WEEK
+    messages_per_day: int = DEFAULT_RATE_LIMIT_MESSAGES_PER_DAY
+    search_pages_per_month: int = DEFAULT_RATE_LIMIT_SEARCH_PAGES_PER_MONTH
+    # How long everything stops once LinkedIn pushes back. The first is doubled
+    # for each repeat within a day.
+    stop_minutes: float = DEFAULT_RATE_LIMIT_STOP_MINUTES
+    empty_page_stop_minutes: float = DEFAULT_RATE_LIMIT_EMPTY_PAGE_STOP_MINUTES
+    challenge_stop_hours: float = DEFAULT_RATE_LIMIT_CHALLENGE_STOP_HOURS
+
+    def validate(self) -> None:
+        """Validate rate limit values."""
+        for name in (
+            "pause_min_seconds",
+            "pause_max_seconds",
+            "stop_minutes",
+            "empty_page_stop_minutes",
+            "challenge_stop_hours",
+        ):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value >= 0):
+                raise ConfigurationError(
+                    f"{name} must be a non-negative finite number, got {value}"
+                )
+        for name in (
+            "visits_per_hour",
+            "visits_per_day",
+            "invites_per_day",
+            "invites_per_week",
+            "messages_per_day",
+            "search_pages_per_month",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ConfigurationError(
+                    f"{name} must be a non-negative whole number, got {value!r}"
+                )
+        if self.pause_min_seconds > self.pause_max_seconds:
+            raise ConfigurationError(
+                "The pause range runs backwards: "
+                f"{self.pause_min_seconds} is more than {self.pause_max_seconds}"
+            )
+
+
+@dataclass
 class AppConfig:
     """Main application configuration."""
 
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     is_interactive: bool = field(default=False)
 
     def validate(self) -> None:
         """Validate all configuration values. Call after modifying config."""
         self.browser.validate()
         self.server.validate()
+        self.rate_limit.validate()
         if self.server.transport == "streamable-http":
             self._validate_transport_config()
             self._validate_path_format()

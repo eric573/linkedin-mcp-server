@@ -9,6 +9,7 @@ from typing import Any, Literal
 import logging
 import re
 
+from linkedin_mcp_server.core import pacing
 from linkedin_mcp_server.core.auth import (
     detect_auth_barrier,
     detect_auth_barrier_quick,
@@ -140,6 +141,7 @@ class PageNavigator:
             return
 
         logger.warning("Authentication barrier detected on %s: %s", url, barrier)
+        pacing.note_auth_route(self._session.page.url)
         message = (
             "LinkedIn requires interactive re-authentication. "
             "Run with --login and complete the account selection/sign-in flow."
@@ -165,6 +167,10 @@ class PageNavigator:
         same allowance a second time.
         """
         page = self._session.page
+        # Before the timeout is worked out from the deadline, so the time spent
+        # waiting for the pace is never charged to the page itself. The gate is
+        # also handed the deadline, and refuses a wait the page cannot follow.
+        await pacing.gate().before_visit(url, deadline=deadline)
         timeout_ms: float = self._GOTO_TIMEOUT_MS
         overall_ms: float | None = None
         if deadline is not None:
@@ -203,20 +209,25 @@ class PageNavigator:
                 # is the clock that expires before a cold browser sends. A
                 # deadline bounds the wait for the request as well, which
                 # the wrapper otherwise runs ahead of the timeout.
-                if type(page).__module__.startswith("patchright."):
-                    await goto_reporting_proxy_errors(
-                        page,
-                        url,
-                        wait_until=wait_until,
-                        timeout=timeout_ms,
-                        overall_timeout=overall_ms,
-                    )
-                else:
-                    await page.goto(
-                        url,
-                        wait_until=wait_until,
-                        timeout=timeout_ms,
-                    )
+                try:
+                    if type(page).__module__.startswith("patchright."):
+                        await goto_reporting_proxy_errors(
+                            page,
+                            url,
+                            wait_until=wait_until,
+                            timeout=timeout_ms,
+                            overall_timeout=overall_ms,
+                        )
+                    else:
+                        await page.goto(
+                            url,
+                            wait_until=wait_until,
+                            timeout=timeout_ms,
+                        )
+                finally:
+                    # The next pause runs from the end of this load, whether
+                    # the page arrived or not: the request went out either way.
+                    pacing.gate().after_visit()
                 await stabilize_navigation(f"goto {url}", logger)
                 await record_page_trace(
                     page,
@@ -328,6 +339,7 @@ class PageNavigator:
                 extra={"target_url": url, "barrier": barrier},
             )
             logger.warning("Authentication barrier detected on %s: %s", url, barrier)
+            pacing.note_auth_route(page.url)
             raise AuthenticationError(
                 "LinkedIn requires interactive re-authentication. "
                 "Run with --login and complete the account selection/sign-in flow."

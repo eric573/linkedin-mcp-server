@@ -22,7 +22,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Voyager / private API.** Out of scope. [Read the rendered page](docs/decisions/2026-09-16-rendered-page.md).
 - **One section = one navigation.** Each entry in `PERSON_SECTIONS` / `COMPANY_SECTIONS` (`linkedin/fields.py`) maps to exactly one page navigation. Never combine multiple URLs behind a single section.
 - **Minimize DOM dependence.** Prefer innerText and URL navigation over DOM selectors. When DOM access is unavoidable, use minimal generic selectors (`a[href*="/jobs/view/"]`) — never class names tied to LinkedIn's layout.
-- **Throttling is a status, not a sentence.** LinkedIn's 429 (and its own 999) is read from the responses the page receives, never from words on the page, which are translated. `core/throttle.py` records them for the length of one call, and a call that fails says what LinkedIn refused, even when its error would otherwise be masked. [Read the decision](docs/decisions/2026-09-23-throttling-is-a-status.md).
+- **Throttling is a status, not a sentence.** LinkedIn's 429 (and its own 999) is read from the responses the page receives, never from words on the page, which are translated. `core/throttle.py` records them for the length of one call, and a call that fails says what LinkedIn refused, even when its error would otherwise be masked. Every refusal, whichever call it answers, also stops all requests for a while. [Read the decision](docs/decisions/2026-10-30-pace-every-linkedin-request.md).
+- **Every request goes through the pacing gate.** A page visit asks `core/pacing.py` first (`before_visit`, then `after_visit` when the load ends), in the same function that navigates; `tests/test_pacing.py` fails on one that does not. An in-page load that fetches more is counted there too: opening a conversation, an endless-list scroll, a "Show more" click. So are invitations and messages, at the click. One budget for the account, never one per tool. A new loop that loads more without asking the gate is a blind spot in the rate limit. [Read the decision](docs/decisions/2026-10-30-pace-every-linkedin-request.md).
 - **Detection must be locale-independent.** Classification logic — connection state, action availability, button identity — must rely on URL patterns (`/preload/custom-invite/?vanityName=USER`, `/in/USER/edit/intro/`, `/messaging/compose/`), attribute *presence* (`aria-label` exists, `aria-expanded` exists, `aria-disabled` exists), or structural counts — never on text values like "Connect", "Follow", "Message", "1st", "Pending". The verb in an `aria-label` is locale-dependent; whether the attribute exists is not. Where text is genuinely the only signal, guard it behind an explicit per-locale table and document the limitation in code.
 
 ## Browser Identity Rules
@@ -143,12 +144,12 @@ All tools that read LinkedIn return: `{url, sections: {name: raw_text}}`.
 Optional additional keys:
 
 - `references: {section_name: [{kind, url, text?, context?, value?}]}` — LinkedIn URLs are relative paths; `value` carries non-URL identifiers (e.g. company URN id for `kind: "company_urn"`)
-- `section_errors: {section_name: {error_type, error_message, issue_template_path, runtime, ...}}`
+- `section_errors: {section_name: {error_type, error_message, issue_template_path, runtime, ...}}` — a `rate_limit` entry the pacing gate caused carries `retry_after` (seconds), and the sections read before it are kept
 - `unknown_sections: [name, ...]`
 - `job_ids: [id, ...]` (search_jobs and get_saved_jobs)
 - `total: {count, exact}` (search_jobs only) — the result count LinkedIn advertises on the first page; `exact` is false for a lower bound such as "500+"
 - `promoted_job_ids: [id, ...]` (search_jobs only) — the subset of `job_ids` shown as promoted; present only when every page could be read, so an empty list means none were
-- `pagination: {pages_fetched, next_offset, reason}` (search_jobs only) — why paging stopped: `complete`, `max_pages`, `time_budget` or `no_new_ids`; `next_offset` is the `start` the next page would have used. Absent when a failure stopped the search, which `section_errors` then explains; a `filters_dropped` or `no_matching_jobs` entry is not a failure and keeps it
+- `pagination: {pages_fetched, next_offset, reason}` (search_jobs only) — why paging stopped: `complete`, `max_pages`, `time_budget`, `no_new_ids` or `rate_limited`; `next_offset` is the `start` the next page would have used. Absent when a failure stopped the search, which `section_errors` then explains; a `filters_dropped` or `no_matching_jobs` entry is not a failure and keeps it, and a `rate_limited` stop keeps it beside its `rate_limit` entry, so the search can resume where the rate limit stopped it
 - `references["feed"]` (get_feed only) — every entry is `kind: "feed_post"`; non-post anchors (sidebar profiles, employer logos) are filtered. URLs may carry either `/feed/update/<urn>/` (DOM-anchor-derived) or `/posts/<slug>` (SDUI-derived) form; both are valid LinkedIn permalinks. An entry paired with a rendered post carries that post's URN as `value` and may carry `text` (an excerpt of the post); a post whose own markup does not name exactly one post URN is not paired, rather than given a guessed URL. Cap is 50 entries, matching `get_feed`'s `num_posts` ceiling.
 - `references["search_results"]` (search_posts only) — DOM references first, then up to 50 `kind: "feed_post"` permalinks read from the page's JSON/document payload responses (`/feed/update/<urn>/` or `/posts/<slug>`, both valid). Captured permalinks are appended, not aligned to result order.
 - `apply: {type, url?}` (get_job_apply_url, which returns no `sections`) — `type` is `easy_apply`, `external`, `applied`, `closed` or `unknown`; `url` is the employer's application link as LinkedIn gives it, never opened, present for external postings
@@ -217,6 +218,11 @@ section LinkedIn rate-limits, `send_message` takes three, and
   `outcome_unknown` may still have sent one.
 - On a login challenge, a CAPTCHA, or a rate-limit page, stop all live checks
   for 24 hours.
+
+The server's own rate limit (`RATE_LIMIT_*`, `core/pacing.py`) paces and caps
+every call for the whole account, and its record lives in the session folder.
+The limits above are for the shared test account and apply as well, whatever
+the server would allow.
 
 ## Release Process
 

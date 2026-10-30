@@ -545,7 +545,8 @@ RELEASE_TOLERANCE_SECONDS = 2.0
 LOSS_TO_RELEASE_SECONDS = 12.1
 #: How long the origin is watched after the release for the read going on.
 #: Had it gone on, the education page would follow the released one after
-#: the product's ``NAV_DELAY`` (2 s) and the experience page's capture.
+#: the experience page's capture and the rate limit's pause, 3-6 s from the end
+#: of that page's load (``core/pacing.py``), so within this window either way.
 CONTINUATION_SECONDS = 10.0
 #: How long the second read is given, once sent, to reach the server before
 #: the loss. Nothing observes that it did; the row claims no more.

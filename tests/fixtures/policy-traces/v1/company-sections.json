@@ -111,7 +111,7 @@
       "call": "read_company",
       "kind": "sleep",
       "reason": "sleep",
-      "seconds": 2.0
+      "seconds": 3.5
     },
     {
       "call": "read_company",
@@ -192,7 +192,7 @@
       "call": "read_company",
       "kind": "boundary.scroll_body",
       "max_scrolls": 10,
-      "pause_time": 1.0
+      "pause_time": 1.25
     },
     {
       "arg": {

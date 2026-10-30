@@ -270,7 +270,11 @@ def create_mcp_server(
     # until its own timeout, or take the lease and leave the process that
     # actually needs it waiting for one held by a caller that never uses it.
     if role.drives_browser:
-        mcp.add_middleware(SequentialToolExecutionMiddleware(silent_owner=silent_owner))
+        mcp.add_middleware(
+            SequentialToolExecutionMiddleware(
+                silent_owner=silent_owner, tool_timeout=tool_timeout
+            )
+        )
     # The notice is appended to one tool result per process, so it belongs
     # wherever a user reads results. On a shared owner it would reach whichever
     # client happened to call first and nobody after that, however many clients
@@ -339,7 +343,9 @@ def create_mcp_server(
             In shared-browser mode these observations belong to the owner, not to a
             frontend running a login. It answers during browser work without refreshing
             the browser idle timer. Use ordinary LinkedIn tools directly for their
-            requested work rather than adding a status preflight.
+            requested work rather than adding a status preflight. The rate_limit
+            block says what the rate limit has spent, what is left, and any stop
+            with the time it ends; check it before planning a long run of calls.
             """
             try:
                 return session_status()

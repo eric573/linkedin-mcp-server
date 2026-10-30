@@ -28,6 +28,7 @@ from linkedin_mcp_server.linkedin.conversations import (
     _StoppedRow,
     _ThreadRefScan,
     _ThreadResolution,
+    _listing_section_errors,
     strip_select_conversation_prefix,
 )
 from linkedin_mcp_server.linkedin.link_metadata import Reference
@@ -244,7 +245,9 @@ class TestExtractConversationThreadRefs:
             limit=50, context="inbox", name_filter="Jacki McMahan"
         )
 
-        assert captured["arg"] == {"limit": 50, "nameFilter": "Jacki McMahan"}
+        arg = captured["arg"]
+        assert isinstance(arg, dict)
+        assert (arg["limit"], arg["nameFilter"]) == (50, "Jacki McMahan")
 
     async def test_rows_that_never_attach_return_nothing_and_click_nothing(
         self, mock_page
@@ -1834,3 +1837,118 @@ class TestWaitForMainText:
             await reader._wait_for_main_text(log_context="Messaging inbox")
 
         assert "Messaging inbox content did not appear" in caplog.text
+
+
+class TestConversationOpensArePaced:
+    """Opening a conversation loads it like a page, so the rate limit counts it."""
+
+    @pytest.fixture
+    def gate(self, profile_dir):
+        from linkedin_mcp_server.config.schema import RateLimitConfig
+        from linkedin_mcp_server.core import pacing
+
+        gate = pacing.Pacing(
+            RateLimitConfig(
+                visits_per_hour=3, pause_min_seconds=0, pause_max_seconds=0
+            ),
+            profile_dir.parent / "rate-limit.json",
+        )
+        pacing.install_gate(gate)
+        return gate
+
+    async def test_a_listing_opens_only_what_the_budget_allows_and_says_so(
+        self, mock_page, gate
+    ):
+        reader = _reader(mock_page)
+        captured: dict[str, Any] = {}
+        rows = [
+            {"ariaLabel": f"Select conversation with Person {n}", "threadId": f"t{n}"}
+            for n in range(3)
+        ]
+
+        async def fake_evaluate(_js: str, arg: dict | None = None) -> dict:
+            captured["arg"] = arg
+            return {**_outcome(*rows), "rowCount": 20}
+
+        mock_page.evaluate = fake_evaluate
+
+        scan = await reader._extract_conversation_thread_refs(limit=20, context="inbox")
+
+        assert captured["arg"]["limit"] == 3
+        assert (captured["arg"]["pauseLowMs"], captured["arg"]["pauseHighMs"]) == (
+            1500.0,
+            3000.0,
+        )
+        assert len(scan.refs) == 3
+        assert scan.held_back == 17
+        assert gate.status()["visits"]["last_hour"] == 3
+        errors = _listing_section_errors("inbox", scan, report_unavailable_rows=True)
+        assert errors is not None
+        assert errors["inbox"]["error_type"] == "rate_limit"
+        assert "held back 17" in errors["inbox"]["error_message"]
+        assert errors["inbox"]["retry_after"] > 0
+
+    async def test_a_click_that_opened_nothing_is_counted_too(self, mock_page, gate):
+        reader = _reader(mock_page)
+
+        async def fake_evaluate(_js: str, arg: dict | None = None) -> dict:
+            return _outcome(
+                {"ariaLabel": "Select conversation with Ada", "threadId": "t1"},
+                stopped_at={"ariaLabel": "Select conversation with Bo", "position": 1},
+            )
+
+        mock_page.evaluate = fake_evaluate
+
+        await reader._extract_conversation_thread_refs(limit=3, context="inbox")
+
+        assert gate.status()["visits"]["last_hour"] == 2
+
+    async def test_a_named_scan_runs_whole_or_not_at_all(self, mock_page, gate):
+        """Cut short, it would renumber the threads `index` picks from."""
+        from linkedin_mcp_server.core import pacing
+
+        reader = _reader(mock_page)
+        captured: dict[str, Any] = {}
+
+        async def fake_evaluate(_js: str, arg: dict | None = None) -> dict:
+            captured["arg"] = arg
+            return _outcome()
+
+        mock_page.evaluate = fake_evaluate
+        gate.record_conversation_opens(2)
+
+        await reader._extract_conversation_thread_refs(
+            limit=None, context="search", name_filter="Ada"
+        )
+        assert captured["arg"]["limit"] is None
+
+        gate.record_conversation_opens(1)
+        captured.clear()
+        with pytest.raises(pacing.PacingRefusedError):
+            await reader._extract_conversation_thread_refs(
+                limit=None, context="search", name_filter="Ada"
+            )
+        assert captured == {}
+
+    async def test_list_scrolls_are_counted_paced_and_stop_with_the_budget(
+        self, mock_page, gate
+    ):
+        reader = _reader(mock_page)
+        gate.record_conversation_opens(2)  # one visit left: five scrolls
+        scrolled: list[object] = []
+
+        async def fake_evaluate(_js: str, arg: dict | None = None) -> bool:
+            scrolled.append(arg)
+            return True
+
+        mock_page.evaluate = fake_evaluate
+
+        with patch.object(PageSession, "delay", new_callable=AsyncMock) as delay:
+            await reader._scroll_main_scrollable_region(
+                position="bottom", attempts=8, pause_time=0.5
+            )
+
+        assert len(scrolled) == 5
+        assert gate.loads_allowed(1) == 0
+        # Never faster than a second apart, whatever the caller asked.
+        assert all(call.args[0] >= 1.0 for call in delay.await_args_list)

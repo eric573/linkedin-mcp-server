@@ -24,12 +24,8 @@ from linkedin_mcp_server.core.utils import (
 )
 
 
-# Pacing between page navigations. Owned by the boundary that performs the
-# pause rather than by any one workflow, because the person, company and job
-# walks pace themselves the same way and a domain service may not import a
-# peer's constant: two copies would let one relocation give two workflows
-# different policies without anything failing.
-NAV_DELAY = 2.0
+# Pacing between page navigations is not set here. Every navigation asks
+# `core/pacing.py` first, so one policy covers every workflow and every tool.
 
 # The key the read wrapper puts the document's own address under. Unlikely to
 # collide with anything a read script returns, because a double answering
@@ -100,9 +96,14 @@ class PageSession:
         """Close an obstructing modal when one is present."""
         return await handle_modal_close(self.page)
 
-    async def scroll_body(self, pause_time: float = 1.0, max_scrolls: int = 10) -> None:
-        """Scroll the page body through the shared utility boundary."""
-        await scroll_to_bottom(
+    async def scroll_body(
+        self, pause_time: float = 1.0, max_scrolls: int = 10
+    ) -> int | None:
+        """Scroll the page body through the shared utility boundary.
+
+        Returns how many scrolls were made, when the boundary says.
+        """
+        return await scroll_to_bottom(
             self.page,
             pause_time=pause_time,
             max_scrolls=max_scrolls,
